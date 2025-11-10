@@ -10,6 +10,7 @@
 # - Export filtered data as CSV
 # - XLSX support + Robust CSV parser toggle
 # - FIX: duplicate headers (Amount, Amount.1, …) handled via first_series()
+# - NEW: day/week/month filters + "treat inflows as income"
 # -------------------------------------------------
 
 import streamlit as st
@@ -282,8 +283,14 @@ def coerce_schema(df):
     # Clean & enrich
     out['amount'] = out['amount'].apply(money_round)
     out = out.dropna(subset=['date','amount'])
-    out['y'] = out['date'].dt.year
+    out['y'] = out['date'].dt.year.astype('Int64')
     out['m'] = out['date'].dt.to_period('M').astype(str)
+    # NEW: day + ISO week columns
+    iso = out['date'].dt.isocalendar()
+    out['d'] = out['date'].dt.date.astype(str)                       # YYYY-MM-DD
+    out['w_num'] = iso.week.astype(int)
+    out['w_year'] = iso.year.astype(int)
+    out['w'] = out['w_year'].astype(str) + "-W" + out['w_num'].astype(str).str.zfill(2)  # e.g., 2025-W45
     out['sign'] = np.where(out['amount'] >= 0, 'inflow','outflow')
     out['desc_norm'] = out['description'].map(normalize_text)
     return out
@@ -426,6 +433,12 @@ transport: uber, lyft, shell, exxon, chevron, bp
 rules_text = st.sidebar.text_area("Edit rules (one line per category: cat: kw1, kw2, ...)", value=rules_default, height=170)
 df = apply_rules(df, rules_text)
 
+# NEW: Treat inflows as income
+st.sidebar.header("💡 Income Handling")
+force_income = st.sidebar.checkbox("Treat every inflow (amount > 0) as 'income'", value=True)
+if force_income:
+    df.loc[df['amount'] > 0, 'category'] = 'income'
+
 # Sidebar: Filters
 st.sidebar.header("🔎 Filters")
 years_avail = sorted(df['y'].dropna().unique().astype(int).tolist())
@@ -437,16 +450,49 @@ acc_pick = st.sidebar.selectbox("Account", accounts)
 cats = ["All"] + sorted(df['category'].astype(str).unique().tolist())
 cat_pick = st.sidebar.selectbox("Category", cats)
 
+# NEW: Day / Week / Month filters (any combination)
+st.sidebar.subheader("🗓️ Date Filters (optional)")
+# available values
+days_avail   = sorted(pd.to_datetime(df['d']).dt.date.unique().tolist())
+weeks_avail  = sorted(df['w'].unique().tolist())            # e.g., 2025-W45
+months_avail = sorted(df['m'].unique().tolist())            # e.g., 2025-11
+
+days_selected   = st.sidebar.multiselect("Day(s)", options=days_avail, default=[])
+weeks_selected  = st.sidebar.multiselect("Week(s) (ISO)", options=weeks_avail, default=[])
+months_selected = st.sidebar.multiselect("Month(s)", options=months_avail, default=[])
+
+# Optional overall date range as well
+st.sidebar.caption("Tip: you can combine multiple date filters; all selected filters apply together (AND).")
+date_range = st.sidebar.date_input("Date range", value=None)
+
 df_f = df.copy()
 if acc_pick != "All": df_f = df_f[df_f['account']==acc_pick]
 if cat_pick != "All": df_f = df_f[df_f['category']==cat_pick]
 if year_single != "All": df_f = df_f[df_f['y']==year_single]
 
-# Sidebar: Budget (optional)
+# Apply day/week/month selections
+if days_selected:
+    ds = set(pd.to_datetime(pd.Series(days_selected)).dt.date.astype(str))
+    df_f = df_f[df_f['d'].isin(ds)]
+if weeks_selected:
+    df_f = df_f[df_f['w'].isin(set(weeks_selected))]
+if months_selected:
+    df_f = df_f[df_f['m'].isin(set(months_selected))]
+
+# Apply date range (if provided as [start, end])
+if isinstance(date_range, (list, tuple)) and len(date_range) == 2 and all(pd.notna(date_range)):
+    start, end = date_range
+    start = pd.to_datetime(start).tz_localize(None)
+    end   = pd.to_datetime(end).tz_localize(None)
+    df_f = df_f[(df_f['date'] >= start) & (df_f['date'] <= end)]
+
+# -----------------------------
+# Budget (optional)
+# -----------------------------
 st.sidebar.header("📊 Monthly Budgets (optional)")
 budget_input = st.sidebar.text_area(
     "Format: category = amount (per month)",
-    value="groceries = 500\nsubscriptions = 60\ncoffee = 80\nrent = 1800\nutilities = 250\ntransport = 200",
+    value="groceries = 500\nsubscriptions = 60\ncoffee = 80\nrent = 1800\nutilities = 250\ntransport = 200\nincome = 0",
     height=140
 )
 budgets = {}
@@ -645,4 +691,4 @@ elif page == "Export":
 
 # Footer hint
 st.markdown("---")
-st.caption("Tips: refine Category Rules to improve charts • Use budgets for alerts • Upload multiple CSVs/XLSX to merge banks/cards")
+st.caption("Tips: refine Category Rules • Budgets for alerts • Upload multiple CSVs/XLSX to merge banks/cards • Use Day/Week/Month filters in the sidebar")
