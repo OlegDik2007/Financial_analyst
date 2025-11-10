@@ -16,8 +16,7 @@ import numpy as np
 import plotly.express as px
 from sklearn.ensemble import IsolationForest
 from io import StringIO
-import re
-import warnings
+import io, csv, re, warnings
 warnings.filterwarnings("ignore")
 
 st.set_page_config(page_title="Bank Statement Analyzer", page_icon="💳", layout="wide")
@@ -51,67 +50,168 @@ def money_round(x):
     try: return float(np.round(x, 2))
     except: return np.nan
 
+# -------- Robust CSV loader (handles preambles, messy quoting, balances) --------
+def _clean_number(s: str):
+    s = str(s).strip()
+    if s == "" or s.lower() in ("nan","none","null","—","-"): return np.nan
+    neg = s.startswith("(") and s.endswith(")")
+    s = s.strip("()")
+    s = s.replace("\xa0","").replace(" ", "")   # nbsp and spaces
+    # European-style "1.234,56"
+    if re.fullmatch(r"-?\d{1,3}(\.\d{3})*,\d{2}", s):
+        s = s.replace(".","").replace(",",".")
+    else:
+        s = s.replace(",", "")
+    s = re.sub(r"[^0-9\.\-]", "", s)
+    try:
+        v = float(s)
+        return -v if neg else v
+    except:
+        return np.nan
+
+def load_bank_csv(path_or_buf):
+    """
+    Robust reader for bank CSVs with summary preambles and inconsistent quoting.
+    Returns a DataFrame with columns: Date, Description, Amount (and Balance if present).
+    """
+    # read text
+    if hasattr(path_or_buf, "read"):
+        text = path_or_buf.read()
+        if isinstance(text, bytes):
+            text = text.decode("utf-8", errors="replace")
+        stream = io.StringIO(text)
+    else:
+        stream = open(path_or_buf, "r", encoding="utf-8", errors="replace", newline="")
+    with stream:
+        reader = csv.reader(stream, delimiter=",", quotechar='"', strict=False)
+        rows = [r for r in reader if r and any(cell.strip() for cell in r)]
+
+    # find header row where first col == Date
+    hdr_idx = 0
+    for i, r in enumerate(rows):
+        if len(r) >= 2 and r[0].strip().lower() == "date":
+            hdr_idx = i
+            break
+
+    header = rows[hdr_idx]
+    cols = []
+    for i, h in enumerate(header):
+        h = (h or "").strip().lower()
+        if h == "date": cols.append("Date")
+        elif h in ("description","details","memo","narrative","payee","merchant","name"): cols.append("Description")
+        elif h in ("amount","debit/credit","debit","credit","amt"): cols.append("Amount")
+        elif h in ("balance","running balance"): cols.append("Balance")
+        else: cols.append(f"col{i}")
+
+    body = rows[hdr_idx+1:]
+    body = [r[:len(cols)] + [""]*(len(cols)-len(r)) if len(r)<len(cols) else r[:len(cols)] for r in body]
+    df = pd.DataFrame(body, columns=cols)
+
+    # parse date
+    if "Date" in df.columns:
+        def _to_date(x):
+            for fmt in ("%m/%d/%Y","%m/%d/%y","%Y-%m-%d","%d.%m.%Y","%d/%m/%Y"):
+                try: return pd.to_datetime(x, format=fmt)
+                except: pass
+            return pd.to_datetime(x, errors="coerce")
+        df["Date"] = df["Date"].map(_to_date)
+
+    # parse numbers
+    if "Amount" in df.columns:
+        df["Amount"] = df["Amount"].map(_clean_number)
+    if "Balance" in df.columns:
+        df["Balance"] = df["Balance"].map(_clean_number)
+
+    return df
+
 @st.cache_data
 def load_csv(file, encoding_try=('utf-8','cp1251','latin1')):
-    last_err = None
-    for enc in encoding_try:
-        try:
-            return pd.read_csv(file, encoding=enc)
-        except Exception as e:
-            last_err = e
-            continue
-    raise last_err
+    """
+    First try normal pandas CSV. If it fails (or yields 1 col), fall back to robust bank parser.
+    """
+    # try vanilla
+    try:
+        df_try = pd.read_csv(file, encoding=encoding_try[0])
+        if df_try.shape[1] > 1:
+            return df_try
+    except Exception:
+        pass
+    # robust fallback
+    return load_bank_csv(file)
+
+# -------- end robust loader --------
 
 def coerce_schema(df):
     df = df.copy()
-    # Guess columns
-    date_col = find_col(df.columns, DATE_HINTS)
-    desc_col = find_col(df.columns, DESC_HINTS)
-    amt_col  = find_col(df.columns, AMT_HINTS)
-    debit_col= find_col(df.columns, DEBIT_HINTS)
-    credit_col=find_col(df.columns, CREDIT_HINTS)
-    cat_col  = find_col(df.columns, CAT_HINTS)
-    acc_col  = find_col(df.columns, ACC_HINTS)
-    curr_col = find_col(df.columns, CURR_HINTS)
 
-    # Build canonical schema
-    out = pd.DataFrame(index=df.index)
-    # Date
-    if date_col is None:
-        # try any column that parses to many datetimes
-        candidate = None
-        for c in df.columns:
-            dt = to_datetime_safe(df[c])
-            if dt.notna().sum() >= len(df)*0.4:
-                candidate = c; break
-        date_col = candidate
-    out['date'] = to_datetime_safe(df[date_col]) if date_col else pd.NaT
-    # Description
-    if desc_col is None: desc_col = df.columns[0]
-    out['description'] = df[desc_col].astype(str)
-    # Account
-    out['account'] = df[acc_col] if acc_col else "Account-1"
-    # Currency
-    out['currency'] = df[curr_col] if curr_col else ""
-    # Amount handling priority: explicit amount -> (credit - debit) -> signed columns
-    if amt_col is not None:
-        out['amount'] = pd.to_numeric(df[amt_col].astype(str).str.replace(',',''), errors='coerce')
+    # If the robust loader already produced normalized headers, just map them.
+    if set(df.columns.str.lower()).issuperset({"date","description","amount"}):
+        out = pd.DataFrame(index=df.index)
+        out["date"] = to_datetime_safe(df["Date"])
+        out["description"] = df["Description"].astype(str)
+        out["account"] = df.get("Account", "Account-1")
+        out["currency"] = df.get("Currency", "")
+        out["category_raw"] = df.get("Category", "")
+        out["amount"] = pd.to_numeric(df["Amount"], errors="coerce")
     else:
-        deb = pd.to_numeric(df[debit_col].astype(str).str.replace(',',''), errors='coerce') if debit_col else 0.0
-        cre = pd.to_numeric(df[credit_col].astype(str).str.replace(',',''), errors='coerce') if credit_col else 0.0
-        # debit negative, credit positive
-        out['amount'] = (cre.fillna(0) - deb.fillna(0)).astype(float)
+        # Guess columns
+        date_col = find_col(df.columns, DATE_HINTS)
+        desc_col = find_col(df.columns, DESC_HINTS)
+        amt_col  = find_col(df.columns, AMT_HINTS)
+        debit_col= find_col(df.columns, DEBIT_HINTS)
+        credit_col=find_col(df.columns, CREDIT_HINTS)
+        cat_col  = find_col(df.columns, CAT_HINTS)
+        acc_col  = find_col(df.columns, ACC_HINTS)
+        curr_col = find_col(df.columns, CURR_HINTS)
 
-    # Category (if present)
-    out['category_raw'] = df[cat_col] if cat_col else ""
+        out = pd.DataFrame(index=df.index)
 
-    # Clean
+        # Date
+        if date_col is None:
+            candidate = None
+            for c in df.columns:
+                dt = to_datetime_safe(df[c])
+                if dt.notna().sum() >= len(df)*0.4:
+                    candidate = c; break
+            date_col = candidate
+        out['date'] = to_datetime_safe(df[date_col]) if date_col else pd.NaT
+
+        # Description
+        if desc_col is None: desc_col = df.columns[0]
+        out['description'] = df[desc_col].astype(str)
+
+        # Account & Currency
+        out['account'] = df[acc_col] if acc_col else "Account-1"
+        out['currency'] = df[curr_col] if curr_col else ""
+
+        # Amount handling (safer parser)
+        def parse_amt_series(s):
+            return pd.to_numeric(
+                s.astype(str)
+                 .str.replace("\xa0","", regex=False)
+                 .str.replace(" ", "", regex=False)
+                 .str.replace(",", "", regex=False)
+                 .str.replace(r"[^\d\.\-\(\)]", "", regex=True)
+                 .map(lambda x: f"-{x.strip('()')}" if x.startswith("(") and x.endswith(")") else x),
+                errors="coerce"
+            )
+
+        if amt_col is not None:
+            out['amount'] = parse_amt_series(df[amt_col])
+        else:
+            deb = parse_amt_series(df[debit_col]) if debit_col else 0.0
+            cre = parse_amt_series(df[credit_col]) if credit_col else 0.0
+            out['amount'] = (cre.fillna(0) - deb.fillna(0)).astype(float)
+
+        # Category (if present)
+        out['category_raw'] = df[cat_col] if cat_col else ""
+
+    # Clean & enrich
     out['amount'] = out['amount'].apply(money_round)
     out = out.dropna(subset=['date','amount'])
     out['y'] = out['date'].dt.year
     out['m'] = out['date'].dt.to_period('M').astype(str)
     out['sign'] = np.where(out['amount'] >= 0, 'inflow','outflow')
-    # normalized text for grouping/recurrence
     out['desc_norm'] = out['description'].map(normalize_text)
     return out
 
@@ -121,7 +221,6 @@ def apply_rules(df, rules_text):
       groceries: walmart, kroger, aldi
       rent: zillow, landlord llc
       salary: payroll, stripe, upwork
-    Comma-separated keywords per line -> set 'category'
     """
     df = df.copy()
     df['category'] = df['category_raw'].astype(str)
@@ -150,12 +249,6 @@ def top_n_series(s, n=15):
     return head
 
 def recurring_candidates(df, min_occ=3, max_cv=0.25):
-    """
-    Find recurring charges by normalized description:
-      - appears >= min_occ months
-      - std/mean <= max_cv (stable amount)
-      - outflows only (expenses)
-    """
     X = df[df['sign']=='outflow'].copy()
     X['abs_amt'] = X['amount'].abs()
     grp = X.groupby(['desc_norm'])
@@ -174,21 +267,17 @@ def recurring_candidates(df, min_occ=3, max_cv=0.25):
     return rec.reset_index()
 
 def detect_duplicates(df, days_window=2, amount_tol=0.01):
-    """
-    Duplicate detection: same abs(amount) and very similar normalized description within a small date window.
-    """
     X = df.copy()
     X['abs_amount'] = X['amount'].abs().round(2)
     X = X.sort_values('date')
     dups = []
     for amt, bucket in X.groupby('abs_amount'):
         b = bucket.sort_values('date')
-        idx = b.index.to_list()
         for i in range(1, len(b)):
             prev = b.iloc[i-1]; cur = b.iloc[i]
             if abs((cur['date'] - prev['date']).days) <= days_window:
                 if cur['desc_norm'][:24] == prev['desc_norm'][:24]:
-                    if abs(cur['abs_amount'] - prev['abs_amount']) <= amount_tol:
+                    if abs(abs(cur['amount']) - abs(prev['amount'])) <= amount_tol:
                         dups.append((prev.name, cur.name))
     mark = pd.Series(False, index=df.index)
     for a,b in dups:
@@ -196,9 +285,6 @@ def detect_duplicates(df, days_window=2, amount_tol=0.01):
     return df.loc[mark].copy().sort_values(['date','amount'])
 
 def isolation_anomalies(df, contamination=0.02):
-    """
-    Amount-based anomalies via IsolationForest (separate inflow/outflow).
-    """
     res = []
     for sgn in ['outflow','inflow']:
         X = df[df['sign']==sgn].copy()
@@ -211,8 +297,8 @@ def isolation_anomalies(df, contamination=0.02):
     return pd.concat(res).sort_values('date')
 
 def download_csv(df, name="export.csv"):
-    csv = df.to_csv(index=False).encode('utf-8')
-    st.download_button("⬇️ Download CSV", data=csv, file_name=name, mime="text/csv")
+    csv_bytes = df.to_csv(index=False).encode('utf-8')
+    st.download_button("⬇️ Download CSV", data=csv_bytes, file_name=name, mime="text/csv")
 
 # -----------------------------
 # Sidebar – data + options
@@ -241,7 +327,7 @@ raw_list = []
 if uploaded:
     for f in uploaded:
         try:
-            df0 = load_csv(f)
+            df0 = load_csv(f)  # now robust
             raw_list.append(df0)
         except Exception as e:
             st.error(f"Failed to read {getattr(f,'name','file')}: {e}")
