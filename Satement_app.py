@@ -8,6 +8,7 @@
 #   Cashflow & Budgets, Recurring (subscriptions), Anomalies & Duplicates
 # - Simple rule-based auto-categorization (editable in sidebar)
 # - Export filtered data as CSV
+# - NEW: XLSX support + Robust CSV parser toggle
 # -------------------------------------------------
 
 import streamlit as st
@@ -16,7 +17,7 @@ import numpy as np
 import plotly.express as px
 from sklearn.ensemble import IsolationForest
 from io import StringIO
-import io, csv, re, warnings
+import io, csv, re, warnings, os
 warnings.filterwarnings("ignore")
 
 st.set_page_config(page_title="Bank Statement Analyzer", page_icon="💳", layout="wide")
@@ -50,13 +51,12 @@ def money_round(x):
     try: return float(np.round(x, 2))
     except: return np.nan
 
-# -------- Robust CSV loader (handles preambles, messy quoting, balances) --------
+# ---------- Robust CSV loader (handles preambles, messy quoting, balances) ----------
 def _clean_number(s: str):
     s = str(s).strip()
     if s == "" or s.lower() in ("nan","none","null","—","-"): return np.nan
     neg = s.startswith("(") and s.endswith(")")
-    s = s.strip("()")
-    s = s.replace("\xa0","").replace(" ", "")   # nbsp and spaces
+    s = s.strip("()").replace("\xa0","").replace(" ", "")
     # European-style "1.234,56"
     if re.fullmatch(r"-?\d{1,3}(\.\d{3})*,\d{2}", s):
         s = s.replace(".","").replace(",",".")
@@ -72,7 +72,7 @@ def _clean_number(s: str):
 def load_bank_csv(path_or_buf):
     """
     Robust reader for bank CSVs with summary preambles and inconsistent quoting.
-    Returns a DataFrame with columns: Date, Description, Amount (and Balance if present).
+    Returns DataFrame with columns: Date, Description, Amount (and Balance if present).
     """
     # read text
     if hasattr(path_or_buf, "read"):
@@ -86,7 +86,7 @@ def load_bank_csv(path_or_buf):
         reader = csv.reader(stream, delimiter=",", quotechar='"', strict=False)
         rows = [r for r in reader if r and any(cell.strip() for cell in r)]
 
-    # find header row where first col == Date
+    # find header row where first col == "Date"
     hdr_idx = 0
     for i, r in enumerate(rows):
         if len(r) >= 2 and r[0].strip().lower() == "date":
@@ -124,27 +124,45 @@ def load_bank_csv(path_or_buf):
 
     return df
 
-@st.cache_data
-def load_csv(file, encoding_try=('utf-8','cp1251','latin1')):
-    """
-    First try normal pandas CSV. If it fails (or yields 1 col), fall back to robust bank parser.
-    """
-    # try vanilla
-    try:
-        df_try = pd.read_csv(file, encoding=encoding_try[0])
-        if df_try.shape[1] > 1:
-            return df_try
-    except Exception:
-        pass
-    # robust fallback
-    return load_bank_csv(file)
+def is_excel_file(uploaded_file) -> bool:
+    name = getattr(uploaded_file, "name", "") or ""
+    return name.lower().endswith((".xlsx", ".xls"))
 
-# -------- end robust loader --------
+def load_excel_first_sheet(file_obj):
+    # Excel reader (first sheet); requires openpyxl for .xlsx
+    try:
+        return pd.read_excel(file_obj, sheet_name=0, engine=None)  # engine auto
+    except ImportError:
+        st.error("Missing Excel engine. Please install `openpyxl` for .xlsx files.")
+        raise
+    except Exception as e:
+        raise
+
+@st.cache_data
+def load_any(file, use_robust_csv: bool = True):
+    """
+    Load CSV (robust optional) or Excel (first sheet).
+    """
+    if is_excel_file(file):
+        return load_excel_first_sheet(file)
+
+    # Otherwise treat as CSV
+    if use_robust_csv:
+        return load_bank_csv(file)
+
+    # Non-robust fallback for clean CSVs
+    try:
+        return pd.read_csv(file, encoding="utf-8")
+    except Exception:
+        # final fallback to robust
+        return load_bank_csv(file)
+
+# ---------- end loaders ----------
 
 def coerce_schema(df):
     df = df.copy()
 
-    # If the robust loader already produced normalized headers, just map them.
+    # If loader already normalized headers, map directly
     if set(df.columns.str.lower()).issuperset({"date","description","amount"}):
         out = pd.DataFrame(index=df.index)
         out["date"] = to_datetime_safe(df["Date"])
@@ -184,7 +202,7 @@ def coerce_schema(df):
         out['account'] = df[acc_col] if acc_col else "Account-1"
         out['currency'] = df[curr_col] if curr_col else ""
 
-        # Amount handling (safer parser)
+        # Amount handling (safe parser)
         def parse_amt_series(s):
             return pd.to_numeric(
                 s.astype(str)
@@ -216,12 +234,6 @@ def coerce_schema(df):
     return out
 
 def apply_rules(df, rules_text):
-    """
-    rules_text format:
-      groceries: walmart, kroger, aldi
-      rent: zillow, landlord llc
-      salary: payroll, stripe, upwork
-    """
     df = df.copy()
     df['category'] = df['category_raw'].astype(str)
     rules = {}
@@ -307,8 +319,15 @@ st.title("💳 Bank Statement Analyzer")
 st.markdown("---")
 
 st.sidebar.header("📂 Data")
-uploaded = st.sidebar.file_uploader("Upload one or more CSV files", type=["csv"], accept_multiple_files=True)
-sample_btn = st.sidebar.button("Load small demo sample")
+use_robust = st.sidebar.checkbox(
+    "Use robust CSV parser (ignore preamble/cleanup fields)", value=True
+)
+uploaded = st.sidebar.file_uploader(
+    "Upload one or more CSV/XLSX files",
+    type=["csv","xlsx","xls"],
+    accept_multiple_files=True
+)
+sample_btn = st.sidebar.button("Load small demo sample (CSV)")
 
 if sample_btn and not uploaded:
     demo = StringIO("""Date,Description,Debit,Credit,Account
@@ -327,13 +346,13 @@ raw_list = []
 if uploaded:
     for f in uploaded:
         try:
-            df0 = load_csv(f)  # now robust
+            df0 = load_any(f, use_robust_csv=use_robust)
             raw_list.append(df0)
         except Exception as e:
             st.error(f"Failed to read {getattr(f,'name','file')}: {e}")
 
 if not raw_list:
-    st.info("Upload CSVs to begin. Supported: columns like Date, Description, Amount or Debit/Credit, Account, Category.")
+    st.info("Upload CSV/XLSX to begin. Supported: Date, Description, Amount or Debit/Credit, Account, Category.")
     st.stop()
 
 df_raw = pd.concat(raw_list, ignore_index=True, sort=False)
@@ -571,4 +590,4 @@ elif page == "Export":
 
 # Footer hint
 st.markdown("---")
-st.caption("Tips: refine Category Rules to improve charts • Use budgets for alerts • Upload multiple CSVs to merge banks/cards")
+st.caption("Tips: refine Category Rules to improve charts • Use budgets for alerts • Upload multiple CSVs/XLSX to merge banks/cards")
