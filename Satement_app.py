@@ -8,7 +8,8 @@
 #   Cashflow & Budgets, Recurring (subscriptions), Anomalies & Duplicates
 # - Simple rule-based auto-categorization (editable in sidebar)
 # - Export filtered data as CSV
-# - NEW: XLSX support + Robust CSV parser toggle
+# - XLSX support + Robust CSV parser toggle
+# - FIX: duplicate headers (Amount, Amount.1, …) handled via first_series()
 # -------------------------------------------------
 
 import streamlit as st
@@ -50,6 +51,55 @@ def normalize_text(s):
 def money_round(x):
     try: return float(np.round(x, 2))
     except: return np.nan
+
+# ---------- utilities for duplicate headers ----------
+def _make_unique(names):
+    seen = {}
+    out = []
+    for n in names:
+        n0 = str(n)
+        if n0 not in seen:
+            seen[n0] = 0
+            out.append(n0)
+        else:
+            seen[n0] += 1
+            out.append(f"{n0}.{seen[n0]}")
+    return out
+
+def first_series(df: pd.DataFrame, name: str):
+    """
+    Return a single Series for a logical column even if there are duplicate headers,
+    e.g., 'Amount', 'Amount.1'. For numeric columns, takes the first non-null per row.
+    """
+    base = name.strip().lower()
+    matches = [c for c in df.columns if c.strip().lower() == base
+               or c.strip().lower().startswith(base + ".")]
+    if not matches:
+        return None
+    if len(matches) == 1:
+        s = df[matches[0]]
+        return s if isinstance(s, pd.Series) else s.iloc[:, 0]
+
+    # multiple columns -> pick first non-null across them
+    tmp = df[matches].copy()
+
+    # numeric cleanup when applicable
+    if base in ("amount","balance"):
+        def _num_clean_col(col):
+            return pd.to_numeric(
+                col.astype(str)
+                   .str.replace("\xa0","", regex=False)
+                   .str.replace(" ", "", regex=False)
+                   .str.replace(",", "", regex=False)
+                   .str.replace(r"[^\d\.\-\(\)]", "", regex=True)
+                   .map(lambda x: f"-{x.strip('()')}" if x.startswith("(") and x.endswith(")") else x),
+                errors="coerce"
+            )
+        for c in matches:
+            tmp[c] = _num_clean_col(tmp[c])
+
+    return tmp.bfill(axis=1).iloc[:, 0]
+# ----------------------------------------------------
 
 # ---------- Robust CSV loader (handles preambles, messy quoting, balances) ----------
 def _clean_number(s: str):
@@ -103,24 +153,31 @@ def load_bank_csv(path_or_buf):
         elif h in ("balance","running balance"): cols.append("Balance")
         else: cols.append(f"col{i}")
 
+    # ensure unique col names BEFORE building DataFrame
+    cols = _make_unique(cols)
+
     body = rows[hdr_idx+1:]
     body = [r[:len(cols)] + [""]*(len(cols)-len(r)) if len(r)<len(cols) else r[:len(cols)] for r in body]
     df = pd.DataFrame(body, columns=cols)
 
     # parse date
-    if "Date" in df.columns:
+    if first_series(df, "Date") is not None:
         def _to_date(x):
             for fmt in ("%m/%d/%Y","%m/%d/%y","%Y-%m-%d","%d.%m.%Y","%d/%m/%Y"):
                 try: return pd.to_datetime(x, format=fmt)
                 except: pass
             return pd.to_datetime(x, errors="coerce")
-        df["Date"] = df["Date"].map(_to_date)
+        d = first_series(df, "Date").map(_to_date)
+        # write back normalized Date column name for fast-path
+        df["Date"] = d
 
-    # parse numbers
-    if "Amount" in df.columns:
-        df["Amount"] = df["Amount"].map(_clean_number)
-    if "Balance" in df.columns:
-        df["Balance"] = df["Balance"].map(_clean_number)
+    # parse numbers (if those headers exist)
+    amt_ser = first_series(df, "Amount")
+    if amt_ser is not None:
+        df["Amount"] = amt_ser.map(_clean_number)
+    bal_ser = first_series(df, "Balance")
+    if bal_ser is not None:
+        df["Balance"] = bal_ser.map(_clean_number)
 
     return df
 
@@ -134,8 +191,6 @@ def load_excel_first_sheet(file_obj):
         return pd.read_excel(file_obj, sheet_name=0, engine=None)  # engine auto
     except ImportError:
         st.error("Missing Excel engine. Please install `openpyxl` for .xlsx files.")
-        raise
-    except Exception as e:
         raise
 
 @st.cache_data
@@ -165,12 +220,12 @@ def coerce_schema(df):
     # If loader already normalized headers, map directly
     if set(df.columns.str.lower()).issuperset({"date","description","amount"}):
         out = pd.DataFrame(index=df.index)
-        out["date"] = to_datetime_safe(df["Date"])
-        out["description"] = df["Description"].astype(str)
+        out["date"] = to_datetime_safe(first_series(df, "Date"))
+        out["description"] = first_series(df, "Description").astype(str)
         out["account"] = df.get("Account", "Account-1")
         out["currency"] = df.get("Currency", "")
         out["category_raw"] = df.get("Category", "")
-        out["amount"] = pd.to_numeric(df["Amount"], errors="coerce")
+        out["amount"] = pd.to_numeric(first_series(df, "Amount"), errors="coerce")
     else:
         # Guess columns
         date_col = find_col(df.columns, DATE_HINTS)
@@ -215,11 +270,11 @@ def coerce_schema(df):
             )
 
         if amt_col is not None:
-            out['amount'] = parse_amt_series(df[amt_col])
+            out['amount'] = parse_amt_series(first_series(df, amt_col))
         else:
-            deb = parse_amt_series(df[debit_col]) if debit_col else 0.0
-            cre = parse_amt_series(df[credit_col]) if credit_col else 0.0
-            out['amount'] = (cre.fillna(0) - deb.fillna(0)).astype(float)
+            deb = parse_amt_series(first_series(df, "debit")) if first_series(df, "debit") is not None else 0.0
+            cre = parse_amt_series(first_series(df, "credit")) if first_series(df, "credit") is not None else 0.0
+            out['amount'] = (pd.Series(cre).fillna(0) - pd.Series(deb).fillna(0)).astype(float)
 
         # Category (if present)
         out['category_raw'] = df[cat_col] if cat_col else ""
