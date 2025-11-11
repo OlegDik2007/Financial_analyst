@@ -1,16 +1,15 @@
 # Bank Statement Analyzer – Streamlit app
 # -------------------------------------------------
 # Features:
-# - Robust CSV ingestion (auto-detect date/amount/description/account)
+# - Robust CSV/XLSX ingestion (auto-detect date/amount/description/account)
 # - Handles separate Debit/Credit columns or signed Amount
-# - Year filter + multi-year comparison (up to 4)
-# - Dashboard (KPIs), Overview, Category Analysis, Merchants,
-#   Cashflow & Budgets, Recurring (subscriptions), Anomalies & Duplicates
-# - Simple rule-based auto-categorization (editable in sidebar)
-# - Export filtered data as CSV
-# - XLSX support + Robust CSV parser toggle
-# - FIX: duplicate headers (Amount, Amount.1, …) handled via first_series()
-# - NEW: day/week/month filters + "treat inflows as income"
+# - Year/day/week/month filters (fixed)
+# - Dashboard, Overview, Categories, Merchants, Cashflow & Budgets,
+#   Recurring, Anomalies & Duplicates, Compare Years, Export
+# - Advanced Filters: amount range, inflow/outflow, repeated amounts/merchants,
+#   exclude transfers, ignore small txns, anomalies-only
+# - Smart Advisor: Pareto savings, hot categories (MoM vs 3M baseline),
+#   subscription creep, fee/duplicate flags, savings plan suggestions
 # -------------------------------------------------
 
 import streamlit as st
@@ -36,8 +35,11 @@ CAT_HINTS  = ['category', 'категория']
 ACC_HINTS  = ['account', 'iban', 'card', 'mask', 'acct']
 CURR_HINTS = ['currency', 'валюта']
 
+FEE_KEYWORDS = ['fee', 'charge', 'commission', 'overdraft', 'atm fee', 'monthly fee', 'maintenance']
+TRANSFER_KEYWORDS = ['transfer', 'zelle', 'venmo', 'paypal', 'self transfer', 'to savings', 'from savings']
+
 def find_col(cols, hints):
-    cl = [c for c in cols if any(h in c.lower() for h in hints)]
+    cl = [c for c in cols if any(h in str(c).lower() for h in hints)]
     return cl[0] if cl else None
 
 def to_datetime_safe(s):
@@ -68,23 +70,15 @@ def _make_unique(names):
     return out
 
 def first_series(df: pd.DataFrame, name: str):
-    """
-    Return a single Series for a logical column even if there are duplicate headers,
-    e.g., 'Amount', 'Amount.1'. For numeric columns, takes the first non-null per row.
-    """
     base = name.strip().lower()
-    matches = [c for c in df.columns if c.strip().lower() == base
-               or c.strip().lower().startswith(base + ".")]
+    matches = [c for c in df.columns if str(c).strip().lower() == base
+               or str(c).strip().lower().startswith(base + ".")]
     if not matches:
         return None
     if len(matches) == 1:
         s = df[matches[0]]
         return s if isinstance(s, pd.Series) else s.iloc[:, 0]
-
-    # multiple columns -> pick first non-null across them
     tmp = df[matches].copy()
-
-    # numeric cleanup when applicable
     if base in ("amount","balance"):
         def _num_clean_col(col):
             return pd.to_numeric(
@@ -98,17 +92,14 @@ def first_series(df: pd.DataFrame, name: str):
             )
         for c in matches:
             tmp[c] = _num_clean_col(tmp[c])
-
     return tmp.bfill(axis=1).iloc[:, 0]
-# ----------------------------------------------------
 
-# ---------- Robust CSV loader (handles preambles, messy quoting, balances) ----------
+# ---------- Robust CSV loader ----------
 def _clean_number(s: str):
     s = str(s).strip()
     if s == "" or s.lower() in ("nan","none","null","—","-"): return np.nan
     neg = s.startswith("(") and s.endswith(")")
     s = s.strip("()").replace("\xa0","").replace(" ", "")
-    # European-style "1.234,56"
     if re.fullmatch(r"-?\d{1,3}(\.\d{3})*,\d{2}", s):
         s = s.replace(".","").replace(",",".")
     else:
@@ -121,11 +112,6 @@ def _clean_number(s: str):
         return np.nan
 
 def load_bank_csv(path_or_buf):
-    """
-    Robust reader for bank CSVs with summary preambles and inconsistent quoting.
-    Returns DataFrame with columns: Date, Description, Amount (and Balance if present).
-    """
-    # read text
     if hasattr(path_or_buf, "read"):
         text = path_or_buf.read()
         if isinstance(text, bytes):
@@ -136,14 +122,10 @@ def load_bank_csv(path_or_buf):
     with stream:
         reader = csv.reader(stream, delimiter=",", quotechar='"', strict=False)
         rows = [r for r in reader if r and any(cell.strip() for cell in r)]
-
-    # find header row where first col == "Date"
     hdr_idx = 0
     for i, r in enumerate(rows):
-        if len(r) >= 2 and r[0].strip().lower() == "date":
-            hdr_idx = i
-            break
-
+        if len(r) >= 2 and str(r[0]).strip().lower() == "date":
+            hdr_idx = i; break
     header = rows[hdr_idx]
     cols = []
     for i, h in enumerate(header):
@@ -153,33 +135,23 @@ def load_bank_csv(path_or_buf):
         elif h in ("amount","debit/credit","debit","credit","amt"): cols.append("Amount")
         elif h in ("balance","running balance"): cols.append("Balance")
         else: cols.append(f"col{i}")
-
-    # ensure unique col names BEFORE building DataFrame
     cols = _make_unique(cols)
-
     body = rows[hdr_idx+1:]
     body = [r[:len(cols)] + [""]*(len(cols)-len(r)) if len(r)<len(cols) else r[:len(cols)] for r in body]
     df = pd.DataFrame(body, columns=cols)
-
-    # parse date
     if first_series(df, "Date") is not None:
         def _to_date(x):
             for fmt in ("%m/%d/%Y","%m/%d/%y","%Y-%m-%d","%d.%m.%Y","%d/%m/%Y"):
                 try: return pd.to_datetime(x, format=fmt)
                 except: pass
             return pd.to_datetime(x, errors="coerce")
-        d = first_series(df, "Date").map(_to_date)
-        # write back normalized Date column name for fast-path
-        df["Date"] = d
-
-    # parse numbers (if those headers exist)
+        df["Date"] = first_series(df, "Date").map(_to_date)
     amt_ser = first_series(df, "Amount")
     if amt_ser is not None:
         df["Amount"] = amt_ser.map(_clean_number)
     bal_ser = first_series(df, "Balance")
     if bal_ser is not None:
         df["Balance"] = bal_ser.map(_clean_number)
-
     return df
 
 def is_excel_file(uploaded_file) -> bool:
@@ -187,38 +159,26 @@ def is_excel_file(uploaded_file) -> bool:
     return name.lower().endswith((".xlsx", ".xls"))
 
 def load_excel_first_sheet(file_obj):
-    # Excel reader (first sheet); requires openpyxl for .xlsx
     try:
-        return pd.read_excel(file_obj, sheet_name=0, engine=None)  # engine auto
+        return pd.read_excel(file_obj, sheet_name=0, engine=None)
     except ImportError:
         st.error("Missing Excel engine. Please install `openpyxl` for .xlsx files.")
         raise
 
 @st.cache_data
 def load_any(file, use_robust_csv: bool = True):
-    """
-    Load CSV (robust optional) or Excel (first sheet).
-    """
     if is_excel_file(file):
         return load_excel_first_sheet(file)
-
-    # Otherwise treat as CSV
     if use_robust_csv:
         return load_bank_csv(file)
-
-    # Non-robust fallback for clean CSVs
     try:
         return pd.read_csv(file, encoding="utf-8")
     except Exception:
-        # final fallback to robust
         return load_bank_csv(file)
 
-# ---------- end loaders ----------
-
+# ---------- schema + enrich ----------
 def coerce_schema(df):
     df = df.copy()
-
-    # If loader already normalized headers, map directly
     if set(df.columns.str.lower()).issuperset({"date","description","amount"}):
         out = pd.DataFrame(index=df.index)
         out["date"] = to_datetime_safe(first_series(df, "Date"))
@@ -228,7 +188,6 @@ def coerce_schema(df):
         out["category_raw"] = df.get("Category", "")
         out["amount"] = pd.to_numeric(first_series(df, "Amount"), errors="coerce")
     else:
-        # Guess columns
         date_col = find_col(df.columns, DATE_HINTS)
         desc_col = find_col(df.columns, DESC_HINTS)
         amt_col  = find_col(df.columns, AMT_HINTS)
@@ -237,10 +196,7 @@ def coerce_schema(df):
         cat_col  = find_col(df.columns, CAT_HINTS)
         acc_col  = find_col(df.columns, ACC_HINTS)
         curr_col = find_col(df.columns, CURR_HINTS)
-
         out = pd.DataFrame(index=df.index)
-
-        # Date
         if date_col is None:
             candidate = None
             for c in df.columns:
@@ -249,16 +205,10 @@ def coerce_schema(df):
                     candidate = c; break
             date_col = candidate
         out['date'] = to_datetime_safe(df[date_col]) if date_col else pd.NaT
-
-        # Description
         if desc_col is None: desc_col = df.columns[0]
         out['description'] = df[desc_col].astype(str)
-
-        # Account & Currency
         out['account'] = df[acc_col] if acc_col else "Account-1"
         out['currency'] = df[curr_col] if curr_col else ""
-
-        # Amount handling (safe parser)
         def parse_amt_series(s):
             return pd.to_numeric(
                 s.astype(str)
@@ -269,28 +219,22 @@ def coerce_schema(df):
                  .map(lambda x: f"-{x.strip('()')}" if x.startswith("(") and x.endswith(")") else x),
                 errors="coerce"
             )
-
         if amt_col is not None:
             out['amount'] = parse_amt_series(first_series(df, amt_col))
         else:
             deb = parse_amt_series(first_series(df, "debit")) if first_series(df, "debit") is not None else 0.0
             cre = parse_amt_series(first_series(df, "credit")) if first_series(df, "credit") is not None else 0.0
             out['amount'] = (pd.Series(cre).fillna(0) - pd.Series(deb).fillna(0)).astype(float)
-
-        # Category (if present)
         out['category_raw'] = df[cat_col] if cat_col else ""
-
-    # Clean & enrich
     out['amount'] = out['amount'].apply(money_round)
     out = out.dropna(subset=['date','amount'])
     out['y'] = out['date'].dt.year.astype('Int64')
     out['m'] = out['date'].dt.to_period('M').astype(str)
-    # NEW: day + ISO week columns
     iso = out['date'].dt.isocalendar()
-    out['d'] = out['date'].dt.date.astype(str)                       # YYYY-MM-DD
+    out['d'] = out['date'].dt.date.astype(str)
     out['w_num'] = iso.week.astype(int)
     out['w_year'] = iso.year.astype(int)
-    out['w'] = out['w_year'].astype(str) + "-W" + out['w_num'].astype(str).str.zfill(2)  # e.g., 2025-W45
+    out['w'] = out['w_year'].astype(str) + "-W" + out['w_num'].astype(str).str.zfill(2)
     out['sign'] = np.where(out['amount'] >= 0, 'inflow','outflow')
     out['desc_norm'] = out['description'].map(normalize_text)
     return out
@@ -305,7 +249,6 @@ def apply_rules(df, rules_text):
             name = name.strip()
             kw_list = [k.strip().lower() for k in kws.split(',') if k.strip()]
             if name and kw_list: rules[name] = kw_list
-    # apply
     for cat, kwds in rules.items():
         mask = False
         for kw in kwds:
@@ -313,14 +256,6 @@ def apply_rules(df, rules_text):
         df.loc[mask, 'category'] = cat
     df['category'] = df['category'].replace('', 'Uncategorized')
     return df
-
-def top_n_series(s, n=15):
-    s = s.dropna()
-    if len(s)==0: return s
-    head = s.head(n)
-    if len(s) > n:
-        head.loc['Other'] = s.iloc[n:].sum()
-    return head
 
 def recurring_candidates(df, min_occ=3, max_cv=0.25):
     X = df[df['sign']=='outflow'].copy()
@@ -364,11 +299,13 @@ def isolation_anomalies(df, contamination=0.02):
         X = df[df['sign']==sgn].copy()
         if len(X) < 20: continue
         model = IsolationForest(random_state=42, contamination=contamination)
-        X['score'] = model.fit_predict(X[['amount']])
-        res.append(X[X['score'] == -1])
+        X['anom'] = model.fit_predict(X[['amount']])
+        X['score'] = model.decision_function(X[['amount']])
+        res.append(X[X['anom'] == -1])
     if not res:
-        return pd.DataFrame(columns=df.columns)
-    return pd.concat(res).sort_values('date')
+        return pd.DataFrame(columns=list(df.columns)+['score'])
+    Z = pd.concat(res).sort_values('date')
+    return Z
 
 def download_csv(df, name="export.csv"):
     csv_bytes = df.to_csv(index=False).encode('utf-8')
@@ -381,16 +318,13 @@ st.title("💳 Bank Statement Analyzer")
 st.markdown("---")
 
 st.sidebar.header("📂 Data")
-use_robust = st.sidebar.checkbox(
-    "Use robust CSV parser (ignore preamble/cleanup fields)", value=True
-)
+use_robust = st.sidebar.checkbox("Use robust CSV parser (recommended)", value=True)
 uploaded = st.sidebar.file_uploader(
     "Upload one or more CSV/XLSX files",
     type=["csv","xlsx","xls"],
     accept_multiple_files=True
 )
 sample_btn = st.sidebar.button("Load small demo sample (CSV)")
-
 if sample_btn and not uploaded:
     demo = StringIO("""Date,Description,Debit,Credit,Account
 2024-11-02,NETFLIX.COM,-15.99,,Chase
@@ -420,7 +354,9 @@ if not raw_list:
 df_raw = pd.concat(raw_list, ignore_index=True, sort=False)
 df = coerce_schema(df_raw)
 
-# Sidebar: Category rules
+# -----------------------------
+# Rules + Income mapping
+# -----------------------------
 st.sidebar.header("🏷️ Category Rules (optional)")
 rules_default = """groceries: walmart, aldi, trader joe, kroger
 coffee: starbucks, dunkin
@@ -429,62 +365,110 @@ salary: payroll, stripe, upwork
 rent: rent, landlord
 utilities: comed, at&t, verizon, tmobile, spectrum
 transport: uber, lyft, shell, exxon, chevron, bp
+fees: fee, overdraft, maintenance, commission
 """
-rules_text = st.sidebar.text_area("Edit rules (one line per category: cat: kw1, kw2, ...)", value=rules_default, height=170)
+rules_text = st.sidebar.text_area("Edit rules (cat: kw1, kw2, ...)", value=rules_default, height=170)
 df = apply_rules(df, rules_text)
 
-# NEW: Treat inflows as income
-st.sidebar.header("💡 Income Handling")
 force_income = st.sidebar.checkbox("Treat every inflow (amount > 0) as 'income'", value=True)
 if force_income:
     df.loc[df['amount'] > 0, 'category'] = 'income'
 
-# Sidebar: Filters
+# -----------------------------
+# Advanced Filters (ALL FIXED)
+# -----------------------------
 st.sidebar.header("🔎 Filters")
-years_avail = sorted(df['y'].dropna().unique().astype(int).tolist())
+
+years_avail = sorted(df['y'].dropna().astype(int).unique().tolist())
 year_single = st.sidebar.selectbox("Single-year view", ["All"] + years_avail)
-years_multi = st.sidebar.multiselect("Compare years (up to 4)", years_avail, max_selections=4)
 
 accounts = ["All"] + sorted(df['account'].astype(str).unique().tolist())
 acc_pick = st.sidebar.selectbox("Account", accounts)
+
 cats = ["All"] + sorted(df['category'].astype(str).unique().tolist())
 cat_pick = st.sidebar.selectbox("Category", cats)
 
-# NEW: Day / Week / Month filters (any combination)
-st.sidebar.subheader("🗓️ Date Filters (optional)")
-# available values
-days_avail   = sorted(pd.to_datetime(df['d']).dt.date.unique().tolist())
-weeks_avail  = sorted(df['w'].unique().tolist())            # e.g., 2025-W45
-months_avail = sorted(df['m'].unique().tolist())            # e.g., 2025-11
+st.sidebar.subheader("🗓️ Date Filters")
+months_avail = sorted(df['m'].unique().tolist())
+weeks_avail  = sorted(df['w'].unique().tolist())
+days_avail   = sorted(pd.to_datetime(df['d']).dt.date.astype(str).unique().tolist())
 
-days_selected   = st.sidebar.multiselect("Day(s)", options=days_avail, default=[])
-weeks_selected  = st.sidebar.multiselect("Week(s) (ISO)", options=weeks_avail, default=[])
-months_selected = st.sidebar.multiselect("Month(s)", options=months_avail, default=[])
+months_selected = st.sidebar.multiselect("Month(s) (YYYY-MM)", options=months_avail, default=[])
+weeks_selected  = st.sidebar.multiselect("Week(s) (ISO, e.g., 2025-W45)", options=weeks_avail, default=[])
+days_selected   = st.sidebar.multiselect("Day(s) (YYYY-MM-DD)", options=days_avail, default=[])
 
-# Optional overall date range as well
-st.sidebar.caption("Tip: you can combine multiple date filters; all selected filters apply together (AND).")
-date_range = st.sidebar.date_input("Date range", value=None)
+date_range = st.sidebar.date_input("Date range (optional)", value=None)
 
+st.sidebar.subheader("💵 Amount & Type")
+min_amt = float(np.nanmin(df['amount'])) if len(df) else -1000.0
+max_amt = float(np.nanmax(df['amount'])) if len(df) else 1000.0
+amt_lo, amt_hi = st.sidebar.slider("Amount range", min_value=float(min_amt), max_value=float(max_amt),
+                                   value=(float(min_amt), float(max_amt)), step=1.0)
+only_high = st.sidebar.checkbox("High amount only (>|$1,000|)", value=False)
+io_type = st.sidebar.selectbox("Flow type", ["All", "Expenses (outflow)", "Income (inflow)"])
+
+st.sidebar.subheader("🔁 Repeats & Noise")
+min_occ_amt = st.sidebar.number_input("Repeated amount threshold (N occurrences)", 2, 50, 3)
+filter_repeated_amounts = st.sidebar.checkbox("Show only repeated amounts", value=False)
+
+min_occ_merch = st.sidebar.number_input("Repeated merchant threshold (N txns)", 2, 100, 3)
+filter_repeated_merch = st.sidebar.checkbox("Show only repeated merchants", value=False)
+
+ignore_small = st.sidebar.checkbox("Ignore small transactions (|amount| < $5)", value=False)
+exclude_transfers = st.sidebar.text_input("Exclude keywords (comma-separated)", value=", ".join(TRANSFER_KEYWORDS))
+
+st.sidebar.subheader("🚨 Anomalies")
+anom_only = st.sidebar.checkbox("Show anomalies only (IsolationForest)", value=False)
+anom_contam = st.sidebar.slider("Anomaly sensitivity", 0.005, 0.15, 0.02, step=0.005)
+
+# ---- Apply filters
 df_f = df.copy()
 if acc_pick != "All": df_f = df_f[df_f['account']==acc_pick]
 if cat_pick != "All": df_f = df_f[df_f['category']==cat_pick]
-if year_single != "All": df_f = df_f[df_f['y']==year_single]
+if year_single != "All": df_f = df_f[df_f['y']==int(year_single)]
 
-# Apply day/week/month selections
-if days_selected:
-    ds = set(pd.to_datetime(pd.Series(days_selected)).dt.date.astype(str))
-    df_f = df_f[df_f['d'].isin(ds)]
-if weeks_selected:
-    df_f = df_f[df_f['w'].isin(set(weeks_selected))]
-if months_selected:
-    df_f = df_f[df_f['m'].isin(set(months_selected))]
+if months_selected: df_f = df_f[df_f['m'].isin(set(months_selected))]
+if weeks_selected:  df_f = df_f[df_f['w'].isin(set(weeks_selected))]
+if days_selected:   df_f = df_f[df_f['d'].isin(set(days_selected))]
 
-# Apply date range (if provided as [start, end])
 if isinstance(date_range, (list, tuple)) and len(date_range) == 2 and all(pd.notna(date_range)):
     start, end = date_range
-    start = pd.to_datetime(start).tz_localize(None)
-    end   = pd.to_datetime(end).tz_localize(None)
+    start = pd.to_datetime(start).normalize()
+    end   = pd.to_datetime(end).normalize()
     df_f = df_f[(df_f['date'] >= start) & (df_f['date'] <= end)]
+
+# amount & type
+if only_high:
+    df_f = df_f[df_f['amount'].abs() > 1000]
+df_f = df_f[(df_f['amount'] >= amt_lo) & (df_f['amount'] <= amt_hi)]
+if io_type == "Expenses (outflow)": df_f = df_f[df_f['sign']=='outflow']
+elif io_type == "Income (inflow)":   df_f = df_f[df_f['sign']=='inflow']
+if ignore_small: df_f = df_f[df_f['amount'].abs() >= 5]
+
+# exclude keywords
+if exclude_transfers.strip():
+    kws = [k.strip().lower() for k in exclude_transfers.split(",") if k.strip()]
+    if kws:
+        mask = np.zeros(len(df_f), dtype=bool)
+        for kw in kws:
+            mask |= df_f['desc_norm'].str.contains(re.escape(kw))
+        df_f = df_f[~mask]
+
+# repeats
+if filter_repeated_amounts:
+    counts_amt = df_f['amount'].abs().round(2).value_counts()
+    keep_amts = counts_amt[counts_amt >= int(min_occ_amt)].index
+    df_f = df_f[df_f['amount'].abs().round(2).isin(keep_amts)]
+
+if filter_repeated_merch:
+    counts_m = df_f['desc_norm'].value_counts()
+    keep_m = counts_m[counts_m >= int(min_occ_merch)].index
+    df_f = df_f[df_f['desc_norm'].isin(keep_m)]
+
+# anomalies
+if anom_only:
+    an = isolation_anomalies(df_f, contamination=anom_contam)
+    df_f = df_f.merge(an[['date','description','amount','score']], on=['date','description','amount'], how='inner')
 
 # -----------------------------
 # Budget (optional)
@@ -510,7 +494,7 @@ st.sidebar.header("📑 Sections")
 page = st.sidebar.radio(
     "Go to",
     ["Dashboard", "Overview", "Categories", "Merchants", "Cashflow & Budgets",
-     "Recurring & Subscriptions", "Anomalies & Duplicates", "Compare Years", "Export"]
+     "Recurring & Subscriptions", "Anomalies & Duplicates", "Compare Years", "Smart Advisor", "Export"]
 )
 
 # -----------------------------
@@ -528,37 +512,25 @@ if page == "Dashboard":
     with c3: st.metric("Net", f"${net:,.2f}")
     with c4: st.metric("Transactions", f"{len(df_f):,}")
 
-    # Monthly trend
     monthly = df_f.groupby('m')['amount'].sum().reset_index()
     monthly['Cashflow'] = monthly['amount']
-    fig = px.bar(monthly, x='m', y='Cashflow', title="Monthly Net Cashflow", labels={'m':'Month'})
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(px.bar(monthly, x='m', y='Cashflow', title="Monthly Net Cashflow", labels={'m':'Month'}), use_container_width=True)
 
-    # Top categories (spend)
-    spend_by_cat = (df_f[df_f['amount']<0]
-                    .groupby('category')['amount'].sum()
-                    .abs().sort_values(ascending=False))
+    spend_by_cat = (df_f[df_f['amount']<0].groupby('category')['amount'].sum().abs().sort_values(ascending=False))
     st.subheader("Top Spend by Category")
     st.plotly_chart(px.bar(top_n_series(spend_by_cat).sort_values(), orientation='h',
                            title="Top Categories by Spend", labels={'value':'Amount','index':'Category'}),
                     use_container_width=True)
 
 # -----------------------------
-# Overview
-# -----------------------------
 elif page == "Overview":
     st.subheader("🧾 Transactions")
     st.dataframe(df_f.sort_values('date', ascending=False), use_container_width=True, height=420)
-
-    st.subheader("Daily / Monthly Flow")
     dly = df_f.groupby('date')['amount'].sum().reset_index()
     st.plotly_chart(px.line(dly, x='date', y='amount', title="Daily Net Flow"), use_container_width=True)
-
     mon = df_f.groupby('m')['amount'].sum().reset_index()
     st.plotly_chart(px.bar(mon, x='m', y='amount', title="Monthly Net Flow", labels={'m':'Month'}), use_container_width=True)
 
-# -----------------------------
-# Categories
 # -----------------------------
 elif page == "Categories":
     st.subheader("🏷️ Category Analysis")
@@ -567,21 +539,15 @@ elif page == "Categories":
     st.dataframe(cat_agg.sort_values('Net'), use_container_width=True, height=420)
 
     spend = (df_f[df_f['amount']<0].groupby('category')['amount'].sum().abs().sort_values(ascending=False))
-    fig = px.bar(top_n_series(spend).sort_values(), orientation='h',
-                 title="Top Spending Categories", labels={'value':'Amount','index':'Category'})
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(px.bar(top_n_series(spend).sort_values(), orientation='h',
+                 title="Top Spending Categories", labels={'value':'Amount','index':'Category'}), use_container_width=True)
 
-    # Category over months
-    cm = (df_f[df_f['amount']<0]
-          .groupby(['m','category'])['amount'].sum()
-          .abs().reset_index())
+    cm = (df_f[df_f['amount']<0].groupby(['m','category'])['amount'].sum().abs().reset_index())
     if len(cm)>0:
         st.plotly_chart(px.line(cm, x='m', y='amount', color='category',
                                 title="Monthly Spend by Category", labels={'m':'Month','amount':'Amount'}),
                         use_container_width=True)
 
-# -----------------------------
-# Merchants
 # -----------------------------
 elif page == "Merchants":
     st.subheader("🏪 Merchants / Payees")
@@ -593,14 +559,11 @@ elif page == "Merchants":
     })
     st.dataframe(tbl.sort_values('total'), use_container_width=True, height=420)
 
-    top_spend_merch = (df_f[df_f['amount']<0]
-                       .groupby('desc_norm')['amount'].sum().abs().sort_values(ascending=False))
+    top_spend_merch = (df_f[df_f['amount']<0].groupby('desc_norm')['amount'].sum().abs().sort_values(ascending=False))
     st.plotly_chart(px.bar(top_n_series(top_spend_merch).sort_values(), orientation='h',
                            title="Top Spending Merchants", labels={'value':'Amount','index':'Merchant'}),
                     use_container_width=True)
 
-# -----------------------------
-# Cashflow & Budgets
 # -----------------------------
 elif page == "Cashflow & Budgets":
     st.subheader("💵 Cashflow")
@@ -622,8 +585,6 @@ elif page == "Cashflow & Budgets":
         st.info("Add budgets in the sidebar to see over/under charts.")
 
 # -----------------------------
-# Recurring & Subscriptions
-# -----------------------------
 elif page == "Recurring & Subscriptions":
     st.subheader("🔁 Recurring Charges / Subscriptions")
     rec = recurring_candidates(df_f)
@@ -634,61 +595,101 @@ elif page == "Recurring & Subscriptions":
         rec_display['mean_amt'] = rec_display['mean_amt'].apply(lambda x: f"${x:,.2f}")
         rec_display['std_amt'] = rec_display['std_amt'].apply(lambda x: f"${x:,.2f}")
         st.dataframe(rec_display, use_container_width=True, height=420)
-
-        # Trend for top recurring merchant
         topm = rec.iloc[0]['desc_norm']
         trend = (df_f[df_f['desc_norm']==topm].groupby('m')['amount'].sum().abs().reset_index())
         st.plotly_chart(px.line(trend, x='m', y='amount', title=f"Monthly spend: {rec.iloc[0]['merchant']}"),
                         use_container_width=True)
 
 # -----------------------------
-# Anomalies & Duplicates
-# -----------------------------
 elif page == "Anomalies & Duplicates":
-    st.subheader("⚠️ Potential Duplicates")
+    st.subheader("⚠️ Potential Duplicates (near-same desc + date proximity)")
     dups = detect_duplicates(df_f)
-    if len(dups)==0:
-        st.success("No obvious duplicates detected.")
-    else:
-        st.dataframe(dups[['date','description','amount','account','category']], use_container_width=True, height=300)
+    if len(dups)==0: st.success("No obvious duplicates detected.")
+    else: st.dataframe(dups[['date','description','amount','account','category']], use_container_width=True, height=300)
 
     st.subheader("🚨 Amount Anomalies (IsolationForest)")
-    anomalies = isolation_anomalies(df_f)
-    if len(anomalies)==0:
-        st.success("No amount anomalies detected (with current data).")
+    anomalies = isolation_anomalies(df_f, contamination=anom_contam)
+    if len(anomalies)==0: st.success("No amount anomalies detected (with current data).")
     else:
-        st.dataframe(anomalies[['date','description','amount','account','category']], use_container_width=True, height=300)
+        show = anomalies[['date','description','amount','score']].sort_values('score')
+        st.dataframe(show, use_container_width=True, height=300)
 
-# -----------------------------
-# Compare Years
 # -----------------------------
 elif page == "Compare Years":
     st.subheader("📆 Year-to-Year Comparison")
+    years_multi = st.sidebar.multiselect("Compare years (up to 4)", years_avail, max_selections=4)
     if not years_multi:
-        st.info("Pick up to 4 years in the sidebar.")
+        st.info("Pick up to 4 years in the sidebar (top).")
     else:
         cdf = df[df['y'].isin(years_multi)].copy()
         totals = cdf.groupby('y')['amount'].sum().reset_index(name='Net')
         st.plotly_chart(px.bar(totals, x='y', y='Net', title="Net cashflow by year", labels={'y':'Year'}), use_container_width=True)
-
         monthly = (cdf.groupby(['m','y'])['amount'].sum().reset_index())
         monthly['_order'] = pd.to_datetime(monthly['m']+'-01')
         monthly = monthly.sort_values('_order')
         st.plotly_chart(px.line(monthly, x='m', y='amount', color='y', title="Monthly net by year", labels={'m':'Month'}), use_container_width=True)
-
-        spend_by_cat = (cdf[cdf['amount']<0]
-                        .groupby(['y','category'])['amount'].sum().abs().reset_index())
+        spend_by_cat = (cdf[cdf['amount']<0].groupby(['y','category'])['amount'].sum().abs().reset_index())
         st.plotly_chart(px.bar(spend_by_cat, x='category', y='amount', color='y', barmode='group',
                                title="Yearly spend by category"), use_container_width=True)
 
 # -----------------------------
-# Export
+elif page == "Smart Advisor":
+    st.subheader("🧠 Smart Advisor – Savings Opportunities")
+
+    # 1) Pareto: 80% of spend comes from top categories
+    spend_cat = df[df['amount']<0].groupby('category')['amount'].sum().abs().sort_values(ascending=False)
+    pareto = spend_cat.cumsum()/spend_cat.sum()
+    pareto_tbl = pd.DataFrame({"category":spend_cat.index, "spend":spend_cat.values, "cum_share":pareto.values})
+    st.markdown("**Pareto categories (cover ≈80% of expenses):**")
+    st.dataframe(pareto_tbl[pareto_tbl["cum_share"]<=0.8], use_container_width=True, height=260)
+
+    # 2) Hot categories: latest month vs 3-month baseline (outflows only)
+    if len(df) > 0:
+        last_month = df['m'].max()
+        last_dt = pd.to_datetime(last_month + "-01")
+        prev3 = pd.date_range(end=last_dt, periods=4, freq='MS')[:-1].strftime("%Y-%m")
+        base = df[(df['amount']<0) & (df['m'].isin(prev3))].groupby('category')['amount'].sum().abs()
+        latest = df[(df['amount']<0) & (df['m']==last_month)].groupby('category')['amount'].sum().abs()
+        hot = (pd.DataFrame({"baseline_3m_avg":base/3}).join(latest.rename("latest"), how="outer")
+               .fillna(0.0))
+        hot["delta"] = hot["latest"] - hot["baseline_3m_avg"]
+        hot = hot.sort_values("delta", ascending=False).head(10)
+        st.markdown(f"**Hot categories (spike in {last_month} vs 3-month avg):**")
+        st.dataframe(hot, use_container_width=True, height=280)
+
+    # 3) Subscription creep: recurring with rising trend
+    rec_all = recurring_candidates(df)
+    if len(rec_all):
+        rec_all['trend'] = rec_all.apply(lambda r: df[(df['desc_norm']==r['desc_norm'])].groupby('m')['amount']
+                                         .sum().abs().reset_index()['amount'].tail(3).diff().mean(), axis=1)
+        creep = rec_all.sort_values('trend', ascending=False).head(10)
+        st.markdown("**Subscriptions trending up (last 3 months):**")
+        st.dataframe(creep[['merchant','months','txns','mean_amt','std_amt','first','last','trend']], use_container_width=True, height=260)
+    else:
+        st.info("No recurring patterns yet for subscription analysis.")
+
+    # 4) Fees/charges
+    fee_mask = np.zeros(len(df), dtype=bool)
+    for kw in FEE_KEYWORDS:
+        fee_mask |= df['desc_norm'].str.contains(re.escape(kw))
+    fees = df[(df['amount']<0) & fee_mask]
+    st.markdown("**Potential fees/charges to reduce:**")
+    if len(fees): st.dataframe(fees[['date','description','amount','account','category']].sort_values('date', ascending=False), use_container_width=True, height=240)
+    else: st.success("No obvious fee keywords found.")
+
+    # 5) Suggested Savings Plan
+    target_pct = st.slider("Target savings % on top Pareto categories", 5, 30, 10, step=1)
+    suggest = pareto_tbl[pareto_tbl["cum_share"]<=0.8].copy()
+    suggest["suggested_cut"] = (suggest["spend"] * target_pct/100.0).round(2)
+    st.markdown("**Suggested savings plan (apply % cut to top categories):**")
+    st.dataframe(suggest.rename(columns={"spend":"monthly_spend"}), use_container_width=True, height=260)
+
 # -----------------------------
 elif page == "Export":
     st.subheader("📤 Export current filtered data")
     download_csv(df_f.sort_values('date'), name="bank_transactions_filtered.csv")
     st.dataframe(df_f.sort_values('date'), use_container_width=True, height=420)
 
-# Footer hint
+# Footer
 st.markdown("---")
-st.caption("Tips: refine Category Rules • Budgets for alerts • Upload multiple CSVs/XLSX to merge banks/cards • Use Day/Week/Month filters in the sidebar")
+st.caption("Tips: refine Category Rules • Use Advanced Filters for noisy data • Smart Advisor highlights where to save • Upload multiple CSVs/XLSX to merge banks/cards")
