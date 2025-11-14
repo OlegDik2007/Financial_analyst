@@ -1,4 +1,4 @@
-# Bank Statement Analyzer – Streamlit app
+# Bank Statement Analyzer – Streamlit app (with AI auto-categorization)
 # -------------------------------------------------
 # Features:
 # - Robust CSV/XLSX ingestion (auto-detect date/amount/description/account)
@@ -10,6 +10,7 @@
 #   exclude transfers, ignore small txns, anomalies-only
 # - Smart Advisor: Pareto savings, hot categories (MoM vs 3M baseline),
 #   subscription creep, fee/duplicate flags, savings plan suggestions
+# - NEW: AI auto-categorization (fills/overrides your rules with confidence control)
 # -------------------------------------------------
 
 import streamlit as st
@@ -20,6 +21,9 @@ from sklearn.ensemble import IsolationForest
 from io import StringIO
 import io, csv, re, warnings, os
 warnings.filterwarnings("ignore")
+
+# 🔗 AI categorizer (new)
+from app_ai import ai_categorize_df, DEFAULT_TAXONOMY
 
 st.set_page_config(page_title="Bank Statement Analyzer", page_icon="💳", layout="wide")
 
@@ -311,6 +315,13 @@ def download_csv(df, name="export.csv"):
     csv_bytes = df.to_csv(index=False).encode('utf-8')
     st.download_button("⬇️ Download CSV", data=csv_bytes, file_name=name, mime="text/csv")
 
+def top_n_series(s, n=12):
+    if len(s) <= n:
+        return s
+    head = s.head(n-1)
+    rest = pd.Series({'Other': s.iloc[n-1:].sum()})
+    return pd.concat([head, rest])
+
 # -----------------------------
 # Sidebar – data + options
 # -----------------------------
@@ -373,6 +384,66 @@ df = apply_rules(df, rules_text)
 force_income = st.sidebar.checkbox("Treat every inflow (amount > 0) as 'income'", value=True)
 if force_income:
     df.loc[df['amount'] > 0, 'category'] = 'income'
+
+# -----------------------------
+# NEW: AI Auto-categorization (runs after rules)
+# -----------------------------
+st.sidebar.header("🤖 AI Auto-categorization")
+use_ai = st.sidebar.checkbox("Use AI to categorize transactions", value=True)
+ai_min_conf = st.sidebar.slider("Autofill/override when confidence ≥", 0.50, 1.00, 0.75, 0.05)
+apply_to_uncat = st.sidebar.checkbox("Fill only Uncategorized with AI", value=True)
+override_when_confident = st.sidebar.checkbox("Override rule if AI is confident", value=False)
+
+ai_info = st.sidebar.expander("AI settings info")
+with ai_info:
+    st.markdown(
+        "- Uses merchant normalization + learned rules + AI model.\n"
+        "- **Fill only Uncategorized** keeps your manual rules unless a row is blank/unknown.\n"
+        "- **Override when confident** will replace your rule if AI confidence ≥ threshold."
+    )
+
+if use_ai and len(df):
+    # Build a tiny input frame for the AI (expected columns: Date/Description/Amount)
+    ai_input = df.rename(columns={
+        "date": "Date", "description": "Description", "amount": "Amount"
+    })[["Date","Description","Amount"]].copy()
+
+    with st.spinner("Categorizing with AI…"):
+        ai_out = ai_categorize_df(
+            ai_input,
+            desc_col="Description",
+            amt_col="Amount",
+            date_col="Date",
+            taxonomy=DEFAULT_TAXONOMY,
+            min_conf_to_autofill=ai_min_conf,
+            batch_size=25
+        )
+
+    # Attach AI columns to main df
+    df["ai_category"]    = ai_out["AI Category"].fillna("").astype(str)
+    df["ai_subcategory"] = ai_out["AI Subcategory"].fillna("").astype(str)
+    df["ai_source"]      = ai_out["AI Source"].fillna("").astype(str)
+    df["ai_confidence"]  = ai_out["AI Confidence"].fillna(0.0).astype(float)
+
+    # Decide how to use AI predictions
+    if apply_to_uncat:
+        mask_uncat = df["category"].str.strip().str.lower().isin(["", "uncategorized", "unknown", "none"])
+        df.loc[mask_uncat, "category"] = df.loc[mask_uncat, "ai_category"].str.lower().replace("", "uncategorized")
+
+    if override_when_confident:
+        mask_conf = df["ai_confidence"] >= ai_min_conf
+        df.loc[mask_conf, "category"] = df.loc[mask_conf, "ai_category"].str.lower().replace("", df.loc[mask_conf, "category"])
+
+    # Quick review: highlight low-confidence rows (not filtered yet)
+    st.sidebar.markdown("**Review low-confidence rows**")
+    low_conf = df[df["ai_confidence"] < ai_min_conf].copy()
+    st.sidebar.write(f"Low-confidence rows: {len(low_conf)}")
+    if len(low_conf) > 0:
+        st.sidebar.dataframe(
+            low_conf[["date","description","amount","category","ai_category","ai_confidence"]]
+            .sort_values("ai_confidence"),
+            use_container_width=True, height=220
+        )
 
 # -----------------------------
 # Advanced Filters (ALL FIXED)
@@ -692,4 +763,4 @@ elif page == "Export":
 
 # Footer
 st.markdown("---")
-st.caption("Tips: refine Category Rules • Use Advanced Filters for noisy data • Smart Advisor highlights where to save • Upload multiple CSVs/XLSX to merge banks/cards")
+st.caption("Tips: refine Category Rules • Use AI for uncategorized or confident overrides • Advanced Filters tame noise • Smart Advisor shows savings ideas")
