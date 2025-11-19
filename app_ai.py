@@ -9,12 +9,8 @@
 # ------------------------------------------------------------
 
 from __future__ import annotations
-
-import hashlib
-import json
-import re
-from typing import Any, Dict, List, Optional
-
+import os, json, re, hashlib
+from typing import List, Dict, Any, Optional
 import pandas as pd
 import streamlit as st
 
@@ -43,29 +39,26 @@ NOISE_PATTERNS = [
     r"\b#\d+\b",
     r"\bTERM\s*\d+\b",
     r"\bSTORE\s*\d+\b",
-    r"\b[A-Z]{2}\s\d{2}/\d{2}\b",  # e.g., "IL 11/04"
-    r"\d{4}-\d{4}-\d{4}",          # masked card
+    r"\b[A-Z]{2}\s\d{2}/\d{2}\b",     # e.g., "IL 11/04"
+    r"\d{4}-\d{4}-\d{4}",             # masked card
     r"\bID[:\s]*\w+\b",
 ]
 
 COMMON_MERCHANT_MAP = {
-    "AMZN": "Amazon",
-    "AMAZON": "Amazon",
-    "WAL-MART": "Walmart",
-    "WALMART": "Walmart",
-    "MCDONALD": "McDonalds",
-    "MCDONALD'S": "McDonalds",
-    "UBER *TRIP": "Uber",
-    "UBER TRIP": "Uber",
-    "LYFT RIDE": "Lyft",
-    "COSTCO WHSE": "Costco",
-    "COSTCO": "Costco",
+    "AMZN": "Amazon", "AMAZON": "Amazon",
+    "WAL-MART": "Walmart", "WALMART": "Walmart",
+    "MCDONALD": "McDonalds", "MCDONALD'S": "McDonalds",
+    "UBER *TRIP": "Uber", "UBER TRIP": "Uber", "UBER": "Uber",
+    "LYFT RIDE": "Lyft", "LYFT": "Lyft",
+    "COSTCO WHSE": "Costco", "COSTCO": "Costco",
     "STARBUCKS": "Starbucks",
     "TARGET": "Target",
     "WALGREENS": "Walgreens",
     "CVS": "CVS",
+    "JEWEL": "Jewel Osco",
+    "OSCO": "Jewel Osco",
+    "TESLA": "Tesla",
 }
-
 
 def normalize_merchant(text: str) -> str:
     """Normalize merchant names by stripping noise and mapping common variants."""
@@ -77,7 +70,6 @@ def normalize_merchant(text: str) -> str:
         if k in t:
             return v
     return t.title()
-
 
 # ==========================
 # 3) Rule Store (learn-as-you-edit)
@@ -91,14 +83,11 @@ def get_rules_store() -> Dict[tuple, Dict[str, str]]:
     """
     return {}
 
-
 def sign_bucket(amount: float) -> str:
     return "inflow" if float(amount) > 0 else "outflow"
 
-
 def apply_rules(merchant: str, amount: float, rules_store: Dict) -> Optional[Dict[str, str]]:
     return rules_store.get((merchant, sign_bucket(amount)))
-
 
 def learn_rule(
     merchant: str,
@@ -115,7 +104,6 @@ def learn_rule(
         "source": src,
     }
 
-
 # ==========================
 # 4) Caching AI Calls
 # ==========================
@@ -124,27 +112,23 @@ def _ai_cache() -> Dict[str, Dict[str, Any]]:
     """Simple in-memory cache for AI results."""
     return {}
 
-
 def cache_get(key: str) -> Optional[Dict[str, Any]]:
     return _ai_cache().get(key)
 
-
 def cache_set(key: str, value: Dict[str, Any]) -> None:
     _ai_cache()[key] = value
-
 
 def make_cache_key(row: Dict[str, Any]) -> str:
     # Cache key buckets by (normalized_merchant, amount, year-month)
     base = f"{row.get('normalized_merchant','')}|{float(row.get('Amount',0)):.2f}|{str(row.get('Date'))[:7]}"
     return hashlib.sha1(base.encode()).hexdigest()
 
-
 # ==========================
 # 5) LLM Client Adapter
 # ==========================
 def call_llm_classify(
     batch_rows: List[Dict[str, Any]],
-    taxonomy: Dict[str, List[str]] | None = None,
+    taxonomy: Dict[str, List[str]] = None,
     provider: str = "openai",
 ) -> List[Dict[str, Any]]:
     """
@@ -160,114 +144,138 @@ def call_llm_classify(
     """
     taxonomy = taxonomy or DEFAULT_TAXONOMY
 
-    # --------------- Real LLM (OpenAI) example ---------------
-    # Uncomment to use. Make sure you set OPENAI_API_KEY in Streamlit secrets.
-    #
-    # try:
-    #     from openai import OpenAI
-    #     client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
-    #     system_prompt = (
-    #         "You are a bank transaction categorizer.\n"
-    #         "Return ONLY JSON with a list of objects (one per transaction) with keys: "
-    #         "category, subcategory, source, confidence (0..1).\n"
-    #         "Use this taxonomy strictly:\n" + json.dumps(taxonomy) + "\n"
-    #         "Rules: inflows -> Income.* unless clearly refunds/transfers; "
-    #         "groceries vs dining by merchant; ride-hail -> Transport.Ride-share/Taxi; "
-    #         "subscriptions -> Entertainment.Subscriptions; "
-    #         "unknown -> Other.Uncategorized with low confidence."
-    #     )
-    #     payload = {"transactions": batch_rows}
-    #     resp = client.responses.create(
-    #         model="gpt-4o-mini",
-    #         input=[
-    #             {"role": "system", "content": system_prompt},
-    #             {"role": "user", "content": json.dumps(payload)},
-    #         ],
-    #         response_format={"type": "json_object"},
-    #     )
-    #     content = resp.output[0].content[0].text  # type: ignore
-    #     parsed = json.loads(content)
-    #     # Expect parsed like {"results":[{...}, ...]} or just a list
-    #     results = parsed.get("results", parsed)
-    #     return results
-    # except Exception as e:
-    #     st.warning(f"LLM call failed, using heuristic fallback. Error: {e}")
-
     # --------------- Heuristic Fallback (Simulator) ---------------
     results: List[Dict[str, Any]] = []
     for r in batch_rows:
         desc = (r.get("description") or "").upper()
         amt = float(r.get("amount") or 0.0)
 
-        # Simple income detection
-        if amt > 0 and ("PAYROLL" in desc or "SALARY" in desc):
-            results.append(
-                {
-                    "category": "Income",
-                    "subcategory": "Salary/W2",
-                    "source": "Payroll/Employer",
-                    "confidence": 0.95,
-                }
-            )
+        # Income patterns
+        if amt > 0 and ("PAYROLL" in desc or "SALARY" in desc or "DIRECT DEP" in desc):
+            results.append({
+                "category": "Income",
+                "subcategory": "Salary/W2",
+                "source": "Payroll/Employer",
+                "confidence": 0.95,
+            })
             continue
 
         if amt > 0 and ("LLC" in desc or "LTD" in desc or "INC" in desc):
-            results.append(
-                {
-                    "category": "Income",
-                    "subcategory": "Business Revenue",
-                    "source": "Business Payout",
-                    "confidence": 0.9,
-                }
-            )
+            results.append({
+                "category": "Income",
+                "subcategory": "Business Revenue",
+                "source": "Business Payout",
+                "confidence": 0.9,
+            })
             continue
 
-        # Common merchants
-        if "AMZN" in desc or "AMAZON" in desc:
-            results.append(
-                {
-                    "category": "Shopping",
-                    "subcategory": "Online Retail",
-                    "source": "Amazon",
-                    "confidence": 0.85,
-                }
-            )
+        # Groceries / supermarkets
+        if any(k in desc for k in ["COSTCO", "WALMART", "TARGET", "JEWEL", "OSCO", "MART ", "MARKET", "WALGREENS"]):
+            results.append({
+                "category": "Groceries",
+                "subcategory": "Supermarket",
+                "source": normalize_merchant(r.get("description", "")),
+                "confidence": 0.8,
+            })
             continue
 
+        # Dining / cafes / fast food
+        if any(k in desc for k in ["STARBUCKS", "DUNKIN", "MCDONALD", "SUSHI", "BURGER", "CAFE", "RESTAURANT"]):
+            results.append({
+                "category": "Dining",
+                "subcategory": "Cafe/Fast Food",
+                "source": normalize_merchant(r.get("description", "")),
+                "confidence": 0.8,
+            })
+            continue
+
+        # Transport: ride share, fuel, tolls, Tesla
         if "UBER" in desc or "LYFT" in desc:
-            results.append(
-                {
-                    "category": "Transport",
-                    "subcategory": "Ride-share/Taxi",
-                    "source": "Uber/Lyft",
-                    "confidence": 0.9,
-                }
-            )
+            results.append({
+                "category": "Transport",
+                "subcategory": "Ride-share/Taxi",
+                "source": "Uber/Lyft",
+                "confidence": 0.9,
+            })
             continue
 
-        if "COSTCO" in desc or "WALMART" in desc or "TARGET" in desc:
-            results.append(
-                {
-                    "category": "Groceries",
-                    "subcategory": "Supermarket",
-                    "source": normalize_merchant(r.get("description", "")),
-                    "confidence": 0.7,
-                }
-            )
+        if any(k in desc for k in ["SHELL", "EXXON", "CHEVRON", "BP ", "GAS STATION", "FUEL", "TESLA SUPERCHARG", "TESLA SC", "TESLA"]):
+            results.append({
+                "category": "Transport",
+                "subcategory": "Fuel",
+                "source": normalize_merchant(r.get("description", "")),
+                "confidence": 0.8,
+            })
+            continue
+
+        if any(k in desc for k in ["TOLLWAY", "IL TOLLWAY", "EZPASS", "PARKING", "PARK DISTRICT"]):
+            results.append({
+                "category": "Transport",
+                "subcategory": "Parking/Tolls",
+                "source": normalize_merchant(r.get("description", "")),
+                "confidence": 0.8,
+            })
+            continue
+
+        # Subscriptions / streaming
+        if any(k in desc for k in ["NETFLIX", "SPOTIFY", "YOUTUBE", "HULU", "DISNEY", "APPLE.COM/BILL", "APPLE MEDIA", "APPLE.COM/BILL", "AMZNPRIME"]):
+            results.append({
+                "category": "Entertainment",
+                "subcategory": "Streaming",
+                "source": normalize_merchant(r.get("description", "")),
+                "confidence": 0.85,
+            })
+            continue
+
+        # Ads / online services – treat as Shopping or Other Entertainment
+        if any(k in desc for k in ["FACEBK", "FACEBOOK", "META ", "GOOGLE ADS", "GOOGLE*ADS"]):
+            results.append({
+                "category": "Entertainment",
+                "subcategory": "Subscriptions",
+                "source": normalize_merchant(r.get("description", "")),
+                "confidence": 0.7,
+            })
+            continue
+
+        # Cash & transfers
+        if any(k in desc for k in ["ZELLE", "VENMO", "CASH APP", "ONLINE BANKING PAYMENT", "ALLY PAYMT", "APPLECARD GSBANK DES PAYMENT"]):
+            results.append({
+                "category": "Cash & Transfers",
+                "subcategory": "Transfer-Out" if amt < 0 else "Transfer-In",
+                "source": normalize_merchant(r.get("description", "")),
+                "confidence": 0.75,
+            })
+            continue
+
+        # Fees/charges
+        if any(k in desc for k in ["FEE", "OVERDRAFT", "LATE FEE", "INTEREST CHARGE", "SERVICE CHARGE"]):
+            results.append({
+                "category": "Fees & Charges",
+                "subcategory": "Bank Fee",
+                "source": normalize_merchant(r.get("description", "")),
+                "confidence": 0.8,
+            })
+            continue
+
+        # Utilities
+        if any(k in desc for k in ["COMED", "NICOR", "AMEREN", "AMERICAN WATER", "WATER CO", "UTIL", "UTILITY"]):
+            results.append({
+                "category": "Housing",
+                "subcategory": "Utilities",
+                "source": normalize_merchant(r.get("description", "")),
+                "confidence": 0.8,
+            })
             continue
 
         # Default: unknown/other
-        results.append(
-            {
-                "category": "Other",
-                "subcategory": "Uncategorized",
-                "source": normalize_merchant(r.get("description", "")),
-                "confidence": 0.4,
-            }
-        )
+        results.append({
+            "category": "Other",
+            "subcategory": "Uncategorized",
+            "source": normalize_merchant(r.get("description", "")),
+            "confidence": 0.4,
+        })
 
     return results
-
 
 # ==========================
 # 6) Main Entry: Categorize a DataFrame
@@ -306,7 +314,6 @@ def ai_categorize_df(
     todo_batch: List[Dict[str, Any]] = []
     idx_batch: List[int] = []
 
-    # Iterate rows
     for i, row in df.iterrows():
         try:
             amt = float(row[amt_col])
@@ -322,66 +329,44 @@ def ai_categorize_df(
             continue
 
         # 2) Cache hit?
-        key = make_cache_key(
-            {"normalized_merchant": nm, "Amount": amt, "Date": row.get(date_col)}
-        )
+        key = make_cache_key({
+            "normalized_merchant": nm,
+            "Amount": amt,
+            "Date": row.get(date_col),
+        })
         cached = cache_get(key)
         if isinstance(cached, dict):
             predictions[i] = cached
             continue
 
         # 3) Queue for AI
-        todo_batch.append(
-            {
-                "description": str(row[desc_col]),
-                "amount": float(amt),
-                "date": str(row.get(date_col, ""))[:10],
-            }
-        )
+        todo_batch.append({
+            "description": str(row[desc_col]),
+            "amount": float(amt),
+            "date": str(row.get(date_col, ""))[:10],
+        })
         idx_batch.append(i)
 
         # Flush if batch is ready
         if len(todo_batch) >= batch_size:
-            _flush_llm_batch(
-                todo_batch,
-                idx_batch,
-                df,
-                amt_col,
-                date_col,
-                taxonomy,
-                min_conf_to_autofill,
-                predictions,
-                rules_store,
-            )
+            _flush_llm_batch(todo_batch, idx_batch, df, amt_col, date_col, taxonomy,
+                             min_conf_to_autofill, predictions, rules_store)
             todo_batch, idx_batch = [], []
 
     # Flush remaining
     if todo_batch:
-        _flush_llm_batch(
-            todo_batch,
-            idx_batch,
-            df,
-            amt_col,
-            date_col,
-            taxonomy,
-            min_conf_to_autofill,
-            predictions,
-            rules_store,
-        )
+        _flush_llm_batch(todo_batch, idx_batch, df, amt_col, date_col, taxonomy,
+                         min_conf_to_autofill, predictions, rules_store)
 
     # Attach predictions to DataFrame
-    pred_df = pd.DataFrame.from_dict(predictions, orient="index").reindex(df.index)
+    pred_df = pd.DataFrame.from_dict(predictions, orient="index")
+    pred_df = pred_df.reindex(df.index)
 
-    df["AI Category"] = pred_df.get("category", pd.Series(index=df.index))
+    df["AI Category"]    = pred_df.get("category", pd.Series(index=df.index))
     df["AI Subcategory"] = pred_df.get("subcategory", pd.Series(index=df.index))
-    df["AI Source"] = pred_df.get("source", pd.Series(index=df.index))
-    df["AI Confidence"] = (
-        pred_df.get("confidence", pd.Series(index=df.index, dtype=float))
-        .astype(float)
-        .round(2)
-    )
+    df["AI Source"]      = pred_df.get("source", pd.Series(index=df.index))
+    df["AI Confidence"]  = pred_df.get("confidence", pd.Series(index=df.index)).round(2)
 
-    # Final editable columns (default to AI values if not already present)
     if "Category" not in df.columns:
         df["Category"] = df["AI Category"]
     if "Subcategory" not in df.columns:
@@ -390,7 +375,6 @@ def ai_categorize_df(
         df["Source"] = df["AI Source"]
 
     return df
-
 
 # ==========================
 # 7) Helper: Flush LLM Batch
@@ -411,25 +395,22 @@ def _flush_llm_batch(
 
     for di, res in zip(idx_batch, results):
         res = {
-            "category": res.get("category", "Other"),
-            "subcategory": res.get("subcategory", "Uncategorized"),
-            "source": res.get("source", df.at[di, "normalized_merchant"]),
+            "category":   res.get("category", "Other"),
+            "subcategory":res.get("subcategory", "Uncategorized"),
+            "source":     res.get("source", df.at[di, "normalized_merchant"]),
             "confidence": float(res.get("confidence", 0.0)),
         }
 
         predictions[di] = res
 
-        key2 = make_cache_key(
-            {
-                "normalized_merchant": df.at[di, "normalized_merchant"],
-                "Amount": float(df.at[di, amt_col]),
-                "Date": df.at[di, date_col],
-            }
-        )
+        key2 = make_cache_key({
+            "normalized_merchant": df.at[di, "normalized_merchant"],
+            "Amount": float(df.at[di, amt_col]),
+            "Date": df.at[di, date_col],
+        })
         cache_set(key2, res)
 
-        # Learn rule if confident and not just "Other"
-        if res["confidence"] >= min_conf_to_autofill and res["category"] != "Other":
+        if res["confidence"] >= min_conf_to_autofill:
             learn_rule(
                 df.at[di, "normalized_merchant"],
                 float(df.at[di, amt_col]),
@@ -438,7 +419,6 @@ def _flush_llm_batch(
                 res["source"],
                 rules_store,
             )
-
 
 # ==========================
 # Optional: tiny utility to add a correction (call from UI)
@@ -454,10 +434,4 @@ def record_user_correction(
     Call this from your UI after the user edits a row to persist a new rule.
     """
     merchant = normalize_merchant(description)
-    learn_rule(
-        merchant,
-        float(amount),
-        chosen_category,
-        chosen_subcategory,
-        chosen_source,
-    )
+    learn_rule(merchant, float(amount), chosen_category, chosen_subcategory, chosen_source)
