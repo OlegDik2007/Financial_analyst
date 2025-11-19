@@ -1,3 +1,4 @@
+# Satement_app.py
 # Bank Statement Analyzer – Streamlit app (with AI auto-categorization)
 # -------------------------------------------------
 # Features:
@@ -33,25 +34,22 @@ st.set_page_config(page_title="Bank Statement Analyzer", page_icon="💳", layou
 # -----------------------------
 DATE_HINTS = ['date', 'posting', 'post date', 'transaction date', 'time', 'дата']
 DESC_HINTS = ['description', 'details', 'memo', 'narrative', 'payee', 'merchant', 'name', 'описание']
-AMT_HINTS = ['amount', 'amt', 'сумма', 'value']
-DEBIT_HINTS = ['debit', 'withdrawal', 'spent', 'charge']
-CREDIT_HINTS = ['credit', 'deposit', 'income', 'received', 'payment']
-CAT_HINTS = ['category', 'категория']
-ACC_HINTS = ['account', 'iban', 'card', 'mask', 'acct']
+AMT_HINTS  = ['amount', 'amt', 'сумма', 'value']
+DEBIT_HINTS= ['debit', 'withdrawal', 'spent', 'charge']
+CREDIT_HINTS=['credit', 'deposit', 'income', 'received', 'payment']
+CAT_HINTS  = ['category', 'категория']
+ACC_HINTS  = ['account', 'iban', 'card', 'mask', 'acct']
 CURR_HINTS = ['currency', 'валюта']
 
 FEE_KEYWORDS = ['fee', 'charge', 'commission', 'overdraft', 'atm fee', 'monthly fee', 'maintenance']
 TRANSFER_KEYWORDS = ['transfer', 'zelle', 'venmo', 'paypal', 'self transfer', 'to savings', 'from savings']
 
-
 def find_col(cols, hints):
     cl = [c for c in cols if any(h in str(c).lower() for h in hints)]
     return cl[0] if cl else None
 
-
 def to_datetime_safe(s):
     return pd.to_datetime(s, errors="coerce", infer_datetime_format=True)
-
 
 def normalize_text(s):
     s = str(s).lower()
@@ -59,13 +57,11 @@ def normalize_text(s):
     s = re.sub(r'\s+', ' ', s).strip()
     return s
 
-
 def money_round(x):
     try:
         return float(np.round(x, 2))
     except Exception:
         return np.nan
-
 
 # ---------- utilities for duplicate headers ----------
 def _make_unique(names):
@@ -80,7 +76,6 @@ def _make_unique(names):
             seen[n0] += 1
             out.append(f"{n0}.{seen[n0]}")
     return out
-
 
 def first_series(df: pd.DataFrame, name: str):
     base = name.strip().lower()
@@ -103,14 +98,16 @@ def first_series(df: pd.DataFrame, name: str):
                    .str.replace(" ", "", regex=False)
                    .str.replace(",", "", regex=False)
                    .str.replace(r"[^\d\.\-\(\)]", "", regex=True)
-                   .map(lambda x: f"-{x.strip('()')}" if x.startswith("(") and x.endswith(")") else x),
-                errors="coerce"
+                   .map(
+                       lambda x: f"-{x.strip('()')}"
+                       if x.startswith("(") and x.endswith(")")
+                       else x
+                   ),
+                errors="coerce",
             )
-
         for c in matches:
             tmp[c] = _num_clean_col(tmp[c])
     return tmp.bfill(axis=1).iloc[:, 0]
-
 
 # ---------- Robust CSV loader ----------
 def _clean_number(s: str):
@@ -119,7 +116,6 @@ def _clean_number(s: str):
         return np.nan
     neg = s.startswith("(") and s.endswith(")")
     s = s.strip("()").replace("\xa0", "").replace(" ", "")
-    # EU-style: 1.234,56
     if re.fullmatch(r"-?\d{1,3}(\.\d{3})*,\d{2}", s):
         s = s.replace(".", "").replace(",", ".")
     else:
@@ -131,8 +127,8 @@ def _clean_number(s: str):
     except Exception:
         return np.nan
 
-
 def load_bank_csv(path_or_buf):
+    # Handles weird CSVs with junk lines, different headers, etc.
     if hasattr(path_or_buf, "read"):
         text = path_or_buf.read()
         if isinstance(text, bytes):
@@ -145,7 +141,6 @@ def load_bank_csv(path_or_buf):
         reader = csv.reader(stream, delimiter=",", quotechar='"', strict=False)
         rows = [r for r in reader if r and any(cell.strip() for cell in r)]
 
-    # find header row (first row whose first cell == 'date')
     hdr_idx = 0
     for i, r in enumerate(rows):
         if len(r) >= 2 and str(r[0]).strip().lower() == "date":
@@ -162,24 +157,22 @@ def load_bank_csv(path_or_buf):
             cols.append("Description")
         elif h in ("amount", "debit/credit", "debit", "credit", "amt"):
             cols.append("Amount")
-        elif h in (
-            "balance",
-            "running balance",
-            "running bal.",
-            "running bal",
-            "running balance.",
-            "runningbal",
-        ):
+        elif h in ("balance", "running balance"):
             cols.append("Balance")
         else:
             cols.append(f"col{i}")
     cols = _make_unique(cols)
 
-    body = rows[hdr_idx + 1:]
-    body = [r[:len(cols)] + [""] * (len(cols) - len(r)) if len(r) < len(cols) else r[:len(cols)] for r in body]
+    body = rows[hdr_idx + 1 :]
+    body = [
+        r[: len(cols)] + [""] * (len(cols) - len(r))
+        if len(r) < len(cols)
+        else r[: len(cols)]
+        for r in body
+    ]
     df = pd.DataFrame(body, columns=cols)
 
-    # parse dates
+    # Parse date
     if first_series(df, "Date") is not None:
         def _to_date(x):
             for fmt in ("%m/%d/%Y", "%m/%d/%y", "%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y"):
@@ -188,25 +181,19 @@ def load_bank_csv(path_or_buf):
                 except Exception:
                     pass
             return pd.to_datetime(x, errors="coerce")
-
         df["Date"] = first_series(df, "Date").map(_to_date)
 
-    # parse amounts
     amt_ser = first_series(df, "Amount")
     if amt_ser is not None:
         df["Amount"] = amt_ser.map(_clean_number)
-
     bal_ser = first_series(df, "Balance")
     if bal_ser is not None:
         df["Balance"] = bal_ser.map(_clean_number)
-
     return df
-
 
 def is_excel_file(uploaded_file) -> bool:
     name = getattr(uploaded_file, "name", "") or ""
     return name.lower().endswith((".xlsx", ".xls"))
-
 
 def load_excel_first_sheet(file_obj):
     try:
@@ -214,7 +201,6 @@ def load_excel_first_sheet(file_obj):
     except ImportError:
         st.error("Missing Excel engine. Please install `openpyxl` for .xlsx files.")
         raise
-
 
 @st.cache_data
 def load_any(file, use_robust_csv: bool = True):
@@ -227,10 +213,10 @@ def load_any(file, use_robust_csv: bool = True):
     except Exception:
         return load_bank_csv(file)
 
-
 # ---------- schema + enrich ----------
 def coerce_schema(df):
     df = df.copy()
+
     if set(df.columns.str.lower()).issuperset({"date", "description", "amount"}):
         out = pd.DataFrame(index=df.index)
         out["date"] = to_datetime_safe(first_series(df, "Date"))
@@ -242,16 +228,16 @@ def coerce_schema(df):
     else:
         date_col = find_col(df.columns, DATE_HINTS)
         desc_col = find_col(df.columns, DESC_HINTS)
-        amt_col = find_col(df.columns, AMT_HINTS)
+        amt_col  = find_col(df.columns, AMT_HINTS)
         debit_col = find_col(df.columns, DEBIT_HINTS)
         credit_col = find_col(df.columns, CREDIT_HINTS)
-        cat_col = find_col(df.columns, CAT_HINTS)
-        acc_col = find_col(df.columns, ACC_HINTS)
+        cat_col  = find_col(df.columns, CAT_HINTS)
+        acc_col  = find_col(df.columns, ACC_HINTS)
         curr_col = find_col(df.columns, CURR_HINTS)
 
         out = pd.DataFrame(index=df.index)
 
-        # date
+        # Pick any column that behaves like a date if header is messy
         if date_col is None:
             candidate = None
             for c in df.columns:
@@ -262,12 +248,9 @@ def coerce_schema(df):
             date_col = candidate
         out["date"] = to_datetime_safe(df[date_col]) if date_col else pd.NaT
 
-        # description
         if desc_col is None:
             desc_col = df.columns[0]
         out["description"] = df[desc_col].astype(str)
-
-        # account / currency
         out["account"] = df[acc_col] if acc_col else "Account-1"
         out["currency"] = df[curr_col] if curr_col else ""
 
@@ -278,16 +261,30 @@ def coerce_schema(df):
                  .str.replace(" ", "", regex=False)
                  .str.replace(",", "", regex=False)
                  .str.replace(r"[^\d\.\-\(\)]", "", regex=True)
-                 .map(lambda x: f"-{x.strip('()')}" if x.startswith("(") and x.endswith(")") else x),
-                errors="coerce"
+                 .map(
+                     lambda x: f"-{x.strip('()')}"
+                     if x.startswith("(") and x.endswith(")")
+                     else x
+                 ),
+                errors="coerce",
             )
 
         if amt_col is not None:
             out["amount"] = parse_amt_series(first_series(df, amt_col))
         else:
-            deb = parse_amt_series(first_series(df, "debit")) if first_series(df, "debit") is not None else 0.0
-            cre = parse_amt_series(first_series(df, "credit")) if first_series(df, "credit") is not None else 0.0
-            out["amount"] = (pd.Series(cre).fillna(0) - pd.Series(deb).fillna(0)).astype(float)
+            deb = (
+                parse_amt_series(first_series(df, "debit"))
+                if first_series(df, "debit") is not None
+                else 0.0
+            )
+            cre = (
+                parse_amt_series(first_series(df, "credit"))
+                if first_series(df, "credit") is not None
+                else 0.0
+            )
+            out["amount"] = (
+                pd.Series(cre).fillna(0) - pd.Series(deb).fillna(0)
+            ).astype(float)
 
         out["category_raw"] = df[cat_col] if cat_col else ""
 
@@ -301,13 +298,15 @@ def coerce_schema(df):
     out["w_num"] = iso.week.astype(int)
     out["w_year"] = iso.year.astype(int)
     out["w"] = out["w_year"].astype(str) + "-W" + out["w_num"].astype(str).str.zfill(2)
-
     out["sign"] = np.where(out["amount"] >= 0, "inflow", "outflow")
     out["desc_norm"] = out["description"].map(normalize_text)
     return out
 
-
 def apply_rules(df, rules_text):
+    """
+    Simple text rules: cat: kw1, kw2, ...
+    These are applied *before* AI, then AI can fill remaining gaps.
+    """
     df = df.copy()
     df["category"] = df["category_raw"].astype(str)
 
@@ -316,7 +315,11 @@ def apply_rules(df, rules_text):
         if ":" in line:
             name, kws = line.split(":", 1)
             name = name.strip()
-            kw_list = [k.strip().lower() for k in kws.split(",") if k.strip()]
+            kw_list = [
+                k.strip().lower()
+                for k in kws.split(",")
+                if k.strip()
+            ]
             if name and kw_list:
                 rules[name] = kw_list
 
@@ -328,7 +331,6 @@ def apply_rules(df, rules_text):
 
     df["category"] = df["category"].replace("", "Uncategorized")
     return df
-
 
 def recurring_candidates(df, min_occ=3, max_cv=0.25):
     X = df[df["sign"] == "outflow"].copy()
@@ -344,10 +346,13 @@ def recurring_candidates(df, min_occ=3, max_cv=0.25):
         merchant=("description", "first"),
     ).fillna({"std_amt": 0})
     stat["cv"] = stat["std_amt"] / stat["mean_amt"].replace(0, np.nan)
-    rec = stat[(stat["months"] >= min_occ) & (stat["cv"] <= max_cv) & (stat["txns"] >= min_occ)]
+    rec = stat[
+        (stat["months"] >= min_occ)
+        & (stat["cv"] <= max_cv)
+        & (stat["txns"] >= min_occ)
+    ]
     rec = rec.sort_values(["months", "txns", "mean_amt"], ascending=[False, False, False])
     return rec.reset_index()
-
 
 def detect_duplicates(df, days_window=2, amount_tol=0.01):
     X = df.copy()
@@ -368,7 +373,6 @@ def detect_duplicates(df, days_window=2, amount_tol=0.01):
         mark.loc[[a, b]] = True
     return df.loc[mark].copy().sort_values(["date", "amount"])
 
-
 def isolation_anomalies(df, contamination=0.02):
     res = []
     for sgn in ["outflow", "inflow"]:
@@ -384,19 +388,16 @@ def isolation_anomalies(df, contamination=0.02):
     Z = pd.concat(res).sort_values("date")
     return Z
 
-
 def download_csv(df, name="export.csv"):
     csv_bytes = df.to_csv(index=False).encode("utf-8")
     st.download_button("⬇️ Download CSV", data=csv_bytes, file_name=name, mime="text/csv")
-
 
 def top_n_series(s, n=12):
     if len(s) <= n:
         return s
     head = s.head(n - 1)
-    rest = pd.Series({"Other": s.iloc[n - 1:].sum()})
+    rest = pd.Series({"Other": s.iloc[n - 1 :].sum()})
     return pd.concat([head, rest])
-
 
 # -----------------------------
 # Sidebar – data + options
@@ -434,10 +435,12 @@ if uploaded:
             df0 = load_any(f, use_robust_csv=use_robust)
             raw_list.append(df0)
         except Exception as e:
-            st.error(f"Failed to read {getattr(f,'name','file')}: {e}")
+            st.error(f"Failed to read {getattr(f, 'name', 'file')}: {e}")
 
 if not raw_list:
-    st.info("Upload CSV/XLSX to begin. Supported: Date, Description, Amount or Debit/Credit, Account, Category.")
+    st.info(
+        "Upload CSV/XLSX to begin. Supported: Date, Description, Amount or Debit/Credit, Account, Category."
+    )
     st.stop()
 
 df_raw = pd.concat(raw_list, ignore_index=True, sort=False)
@@ -447,19 +450,27 @@ df = coerce_schema(df_raw)
 # Rules + Income mapping
 # -----------------------------
 st.sidebar.header("🏷️ Category Rules (optional)")
-rules_default = """groceries: walmart, aldi, trader joe, kroger
-coffee: starbucks, dunkin
-subscriptions: netflix, spotify, youtube, apple media, icloud
-salary: payroll, stripe, upwork
-rent: rent, landlord
-utilities: comed, at&t, verizon, tmobile, spectrum
-transport: uber, lyft, shell, exxon, chevron, bp
-fees: fee, overdraft, maintenance, commission
+
+# NOTE: extended default rules to aggressively reduce 'Uncategorized'
+rules_default = """\
+groceries: walmart, aldi, trader joe, kroger, costco, jewel, osco, market, mart, target, walgreens, h mart, naperville market, sunberry orch, keller s farm, goebberts
+coffee: starbucks, dunkin, mcdonald, mc donald, sushi, cafe, cookie dough
+subscriptions: netflix, spotify, youtube, hulu, disney, apple media, apple.com/bill, icloud, google ads, google*ads, facebk, facebook, meta veri, meta ads, manus ai
+salary: payroll, stripe, upwork, direct deposit, paycheck
+rent: rent, landlord, mnrd-
+utilities: comed, at&t, verizon, tmobile, spectrum, american water, nicor, ameren, water wo, utility, city of
+transport: uber, lyft, shell, exxon, chevron, bp, tollway, il tollway, ezpass, parking, parking fee, park district, transponder, gas station, gasolin, fuel, tesla supercharg, tesla sc, tesla, metro
+fees: fee, overdraft, maintenance, commission, interest charge, late fee, returned item fee
 """
-rules_text = st.sidebar.text_area("Edit rules (cat: kw1, kw2, ...)", value=rules_default, height=170)
+
+rules_text = st.sidebar.text_area(
+    "Edit rules (cat: kw1, kw2, ...)", value=rules_default, height=220
+)
 df = apply_rules(df, rules_text)
 
-force_income = st.sidebar.checkbox("Treat every inflow (amount > 0) as 'income'", value=True)
+force_income = st.sidebar.checkbox(
+    "Treat every inflow (amount > 0) as 'income'", value=True
+)
 if force_income:
     df.loc[df["amount"] > 0, "category"] = "income"
 
@@ -468,16 +479,21 @@ if force_income:
 # -----------------------------
 st.sidebar.header("🤖 AI Auto-categorization")
 use_ai = st.sidebar.checkbox("Use AI to categorize transactions", value=True)
-ai_min_conf = st.sidebar.slider("Autofill/override when confidence ≥", 0.50, 1.00, 0.75, 0.05)
+ai_min_conf = st.sidebar.slider(
+    "Autofill/override when confidence ≥", 0.50, 1.00, 0.75, 0.05
+)
 apply_to_uncat = st.sidebar.checkbox("Fill only Uncategorized with AI", value=True)
-override_when_confident = st.sidebar.checkbox("Override rule if AI is confident", value=False)
+override_when_confident = st.sidebar.checkbox(
+    "Override rule if AI is confident", value=False
+)
 
 ai_info = st.sidebar.expander("AI settings info")
 with ai_info:
     st.markdown(
-        "- Uses merchant normalization + learned rules + AI model.\n"
+        "- Uses merchant normalization + learned rules + AI/heuristics.\n"
         "- **Fill only Uncategorized** keeps your manual rules unless a row is blank/unknown.\n"
-        "- **Override when confident** will replace your rule if AI confidence ≥ threshold."
+        "- **Override when confident** will replace your rule if AI confidence ≥ threshold.\n"
+        "- AI predictions with category='Other' are treated as *not useful* and ignored."
     )
 
 if use_ai and len(df):
@@ -503,20 +519,31 @@ if use_ai and len(df):
     df["ai_source"] = ai_out["AI Source"].fillna("").astype(str)
     df["ai_confidence"] = ai_out["AI Confidence"].fillna(0.0).astype(float)
 
-    # Safer usage: never overwrite with empty / "other"
     ai_cat_lower = df["ai_category"].str.strip().str.lower()
-    ai_conf = df["ai_confidence"]
-    mask_ai_useful = ai_cat_lower.notna() & (ai_cat_lower != "") & (ai_cat_lower != "other")
+    usable_ai = (
+        ai_cat_lower.notna()
+        & (ai_cat_lower != "")
+        & (ai_cat_lower != "other")
+    )
 
+    # 1) Fill Uncategorized using AI (only when confident + not "Other")
     if apply_to_uncat:
         mask_uncat = df["category"].str.strip().str.lower().isin(
             ["", "uncategorized", "unknown", "none"]
         )
-        mask = mask_uncat & mask_ai_useful
+        mask = (
+            mask_uncat
+            & usable_ai
+            & (df["ai_confidence"] >= ai_min_conf)
+        )
         df.loc[mask, "category"] = ai_cat_lower[mask]
 
+    # 2) Optionally override *existing* rule-based categories when AI is confident
     if override_when_confident:
-        mask_conf = (ai_conf >= ai_min_conf) & mask_ai_useful
+        mask_conf = (
+            usable_ai
+            & (df["ai_confidence"] >= ai_min_conf)
+        )
         df.loc[mask_conf, "category"] = ai_cat_lower[mask_conf]
 
     # Quick review: highlight low-confidence rows (not filtered yet)
@@ -526,7 +553,14 @@ if use_ai and len(df):
     if len(low_conf) > 0:
         st.sidebar.dataframe(
             low_conf[
-                ["date", "description", "amount", "category", "ai_category", "ai_confidence"]
+                [
+                    "date",
+                    "description",
+                    "amount",
+                    "category",
+                    "ai_category",
+                    "ai_confidence",
+                ]
             ].sort_values("ai_confidence"),
             use_container_width=True,
             height=220,
@@ -574,26 +608,36 @@ amt_lo, amt_hi = st.sidebar.slider(
     step=1.0,
 )
 only_high = st.sidebar.checkbox("High amount only (>|$1,000|)", value=False)
-io_type = st.sidebar.selectbox("Flow type", ["All", "Expenses (outflow)", "Income (inflow)"])
+io_type = st.sidebar.selectbox(
+    "Flow type", ["All", "Expenses (outflow)", "Income (inflow)"]
+)
 
 st.sidebar.subheader("🔁 Repeats & Noise")
 min_occ_amt = st.sidebar.number_input(
     "Repeated amount threshold (N occurrences)", 2, 50, 3
 )
-filter_repeated_amounts = st.sidebar.checkbox("Show only repeated amounts", value=False)
+filter_repeated_amounts = st.sidebar.checkbox(
+    "Show only repeated amounts", value=False
+)
 
 min_occ_merch = st.sidebar.number_input(
     "Repeated merchant threshold (N txns)", 2, 100, 3
 )
-filter_repeated_merch = st.sidebar.checkbox("Show only repeated merchants", value=False)
+filter_repeated_merch = st.sidebar.checkbox(
+    "Show only repeated merchants", value=False
+)
 
-ignore_small = st.sidebar.checkbox("Ignore small transactions (|amount| < $5)", value=False)
+ignore_small = st.sidebar.checkbox(
+    "Ignore small transactions (|amount| < $5)", value=False
+)
 exclude_transfers = st.sidebar.text_input(
     "Exclude keywords (comma-separated)", value=", ".join(TRANSFER_KEYWORDS)
 )
 
 st.sidebar.subheader("🚨 Anomalies")
-anom_only = st.sidebar.checkbox("Show anomalies only (IsolationForest)", value=False)
+anom_only = st.sidebar.checkbox(
+    "Show anomalies only (IsolationForest)", value=False
+)
 anom_contam = st.sidebar.slider(
     "Anomaly sensitivity", 0.005, 0.15, 0.02, step=0.005
 )
@@ -653,18 +697,14 @@ if filter_repeated_merch:
     keep_m = counts_m[counts_m >= int(min_occ_merch)].index
     df_f = df_f[df_f["desc_norm"].isin(keep_m)]
 
-# anomalies – safe version (no NameError)
+# anomalies
 if anom_only:
     an = isolation_anomalies(df_f, contamination=anom_contam)
-    if an is None or len(an) == 0:
-        # no anomalies -> empty filtered frame
-        df_f = df_f.iloc[0:0]
-    else:
-        df_f = df_f.merge(
-            an[["date", "description", "amount", "score"]],
-            on=["date", "description", "amount"],
-            how="inner",
-        )
+    df_f = df_f.merge(
+        an[["date", "description", "amount", "score"]],
+        on=["date", "description", "amount"],
+        how="inner",
+    )
 
 # -----------------------------
 # Budget (optional)
@@ -672,7 +712,15 @@ if anom_only:
 st.sidebar.header("📊 Monthly Budgets (optional)")
 budget_input = st.sidebar.text_area(
     "Format: category = amount (per month)",
-    value="groceries = 500\nsubscriptions = 60\ncoffee = 80\nrent = 1800\nutilities = 250\ntransport = 200\nincome = 0",
+    value=(
+        "groceries = 500\n"
+        "subscriptions = 60\n"
+        "coffee = 80\n"
+        "rent = 1800\n"
+        "utilities = 250\n"
+        "transport = 200\n"
+        "income = 0"
+    ),
     height=140,
 )
 budgets = {}
@@ -780,9 +828,7 @@ elif page == "Categories":
     cat_agg = df_f.groupby(["category", "sign"])["amount"].sum().unstack(fill_value=0)
     cat_agg["Net"] = cat_agg.sum(axis=1)
     st.dataframe(
-        cat_agg.sort_values("Net"),
-        use_container_width=True,
-        height=420,
+        cat_agg.sort_values("Net"), use_container_width=True, height=420
     )
 
     spend = (
@@ -836,7 +882,9 @@ elif page == "Merchants":
             .values,
         }
     )
-    st.dataframe(tbl.sort_values("total"), use_container_width=True, height=420)
+    st.dataframe(
+        tbl.sort_values("total"), use_container_width=True, height=420
+    )
 
     top_spend_merch = (
         df_f[df_f["amount"] < 0]
@@ -860,7 +908,13 @@ elif page == "Cashflow & Budgets":
     st.subheader("💵 Cashflow")
     flow = df_f.groupby("m")["amount"].sum().reset_index()
     st.plotly_chart(
-        px.bar(flow, x="m", y="amount", title="Monthly Net Cashflow", labels={"m": "Month"}),
+        px.bar(
+            flow,
+            x="m",
+            y="amount",
+            title="Monthly Net Cashflow",
+            labels={"m": "Month"},
+        ),
         use_container_width=True,
     )
 
@@ -903,15 +957,16 @@ elif page == "Recurring & Subscriptions":
     else:
         rec_display = rec[
             ["merchant", "months", "txns", "mean_amt", "std_amt", "first", "last"]
-        ].copy()
+        ]
         rec_display["mean_amt"] = rec_display["mean_amt"].apply(
             lambda x: f"${x:,.2f}"
         )
         rec_display["std_amt"] = rec_display["std_amt"].apply(
             lambda x: f"${x:,.2f}"
         )
-        st.dataframe(rec_display, use_container_width=True, height=420)
-
+        st.dataframe(
+            rec_display, use_container_width=True, height=420
+        )
         topm = rec.iloc[0]["desc_norm"]
         trend = (
             df_f[df_f["desc_norm"] == topm]
@@ -974,7 +1029,11 @@ elif page == "Compare Years":
             ),
             use_container_width=True,
         )
-        monthly = cdf.groupby(["m", "y"])["amount"].sum().reset_index()
+        monthly = (
+            cdf.groupby(["m", "y"])["amount"]
+            .sum()
+            .reset_index()
+        )
         monthly["_order"] = pd.to_datetime(monthly["m"] + "-01")
         monthly = monthly.sort_values("_order")
         st.plotly_chart(
@@ -1034,7 +1093,9 @@ elif page == "Smart Advisor":
     if len(df) > 0:
         last_month = df["m"].max()
         last_dt = pd.to_datetime(last_month + "-01")
-        prev3 = pd.date_range(end=last_dt, periods=4, freq="MS")[:-1].strftime("%Y-%m")
+        prev3 = pd.date_range(end=last_dt, periods=4, freq="MS")[:-1].strftime(
+            "%Y-%m"
+        )
         base = (
             df[(df["amount"] < 0) & (df["m"].isin(prev3))]
             .groupby("category")["amount"]
@@ -1054,14 +1115,16 @@ elif page == "Smart Advisor":
         )
         hot["delta"] = hot["latest"] - hot["baseline_3m_avg"]
         hot = hot.sort_values("delta", ascending=False).head(10)
-        st.markdown(f"**Hot categories (spike in {last_month} vs 3-month avg):**")
+        st.markdown(
+            f"**Hot categories (spike in {last_month} vs 3-month avg):**"
+        )
         st.dataframe(hot, use_container_width=True, height=280)
 
     # 3) Subscription creep: recurring with rising trend
     rec_all = recurring_candidates(df)
     if len(rec_all):
         rec_all["trend"] = rec_all.apply(
-            lambda r: df[(df["desc_norm"] == r["desc_norm"])]
+            lambda r: df[df["desc_norm"] == r["desc_norm"]]
             .groupby("m")["amount"]
             .sum()
             .abs()
@@ -1075,7 +1138,16 @@ elif page == "Smart Advisor":
         st.markdown("**Subscriptions trending up (last 3 months):**")
         st.dataframe(
             creep[
-                ["merchant", "months", "txns", "mean_amt", "std_amt", "first", "last", "trend"]
+                [
+                    "merchant",
+                    "months",
+                    "txns",
+                    "mean_amt",
+                    "std_amt",
+                    "first",
+                    "last",
+                    "trend",
+                ]
             ],
             use_container_width=True,
             height=260,
@@ -1091,9 +1163,9 @@ elif page == "Smart Advisor":
     st.markdown("**Potential fees/charges to reduce:**")
     if len(fees):
         st.dataframe(
-            fees[["date", "description", "amount", "account", "category"]].sort_values(
-                "date", ascending=False
-            ),
+            fees[
+                ["date", "description", "amount", "account", "category"]
+            ].sort_values("date", ascending=False),
             use_container_width=True,
             height=240,
         )
@@ -1105,8 +1177,12 @@ elif page == "Smart Advisor":
         "Target savings % on top Pareto categories", 5, 30, 10, step=1
     )
     suggest = pareto_tbl[pareto_tbl["cum_share"] <= 0.8].copy()
-    suggest["suggested_cut"] = (suggest["spend"] * target_pct / 100.0).round(2)
-    st.markdown("**Suggested savings plan (apply % cut to top categories):**")
+    suggest["suggested_cut"] = (
+        suggest["spend"] * target_pct / 100.0
+    ).round(2)
+    st.markdown(
+        "**Suggested savings plan (apply % cut to top categories):**"
+    )
     st.dataframe(
         suggest.rename(columns={"spend": "monthly_spend"}),
         use_container_width=True,
@@ -1118,9 +1194,7 @@ elif page == "Export":
     st.subheader("📤 Export current filtered data")
     download_csv(df_f.sort_values("date"), name="bank_transactions_filtered.csv")
     st.dataframe(
-        df_f.sort_values("date"),
-        use_container_width=True,
-        height=420,
+        df_f.sort_values("date"), use_container_width=True, height=420
     )
 
 # Footer
